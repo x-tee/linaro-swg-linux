@@ -30,3 +30,13 @@ config OPTEE_STATIC_PROTMEM_POOL
 	bool
 	depends on HAS_IOMEM && TEE_DMABUF_HEAPS
 	default y
+
+config OPTEE_TEELOG
+	bool "OP-TEE TEE log export (resident page ledger)"
+	depends on TEE
+	help
+	  Build the resident teelog page-allocation ledger into the TEE
+	  framework core (tee.o). The ledger survives optee.ko unload so a
+	  later probe can safely reclaim log pages. Selecting this does not
+	  require CONFIG_OPTEE=y; OP-TEE may still be built as a module.
+	  The ledger is a single slot: only one log allocation at a time.

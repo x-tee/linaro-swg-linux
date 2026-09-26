@@ -22,4 +22,12 @@ source "drivers/tee/amdtee/Kconfig"
 source "drivers/tee/tstee/Kconfig"
 source "drivers/tee/qcomtee/Kconfig"
 
+config TEELOG_LEDGER_KUNIT_TEST
+	tristate "KUnit tests for teelog resident ledger" if !KUNIT_ALL_TESTS
+	depends on OPTEE_TEELOG && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for teelog_ledger_* in tee_core. Does not talk to a
+	  real TEE; cannot prove lost-contact recovery end-to-end.
+
 endif

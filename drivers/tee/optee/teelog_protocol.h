@@ -238,13 +238,17 @@ struct teelog_stats {
  *       lives in tee_core resident state (not optee.ko), so reload does not
  *       reset the counter.
  *
+ *   int teelog_ledger_mark_isolated(u32 generation);
+ *       Under ledger mutex: set isolated on matching slot. Preserves
+ *       pa/size/order/generation. Lost-contact path only.
+ *
  *   int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
  *			      bool *isolated);
  *   int teelog_ledger_release_once(u32 generation);
  *
  * Lock order (outer → inner):
  *   teelog_ledger_begin/end (lifecycle mutex)
- *     → ledger mutex (taken inside release_once / record / lookup)
+ *     → ledger mutex (taken inside release_once / record / lookup / mark_isolated)
  * Notif callback removal uses RCU (rcu_read_lock on dispatch,
  * synchronize_rcu after pointer clear). Trace/IRQ/worker must not take the
  * lifecycle mutex.

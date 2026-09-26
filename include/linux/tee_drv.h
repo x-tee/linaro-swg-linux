@@ -322,4 +322,80 @@ struct tee_client_driver {
 #define to_tee_client_driver(d) \
 		container_of_const(d, struct tee_client_driver, driver)
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+/**
+ * teelog_ledger_begin() - Take the resident teelog lifecycle lock
+ *
+ * Serialises record→REGISTER and lookup→UNREGISTER→release_once transactions.
+ * Nested begin from the same task returns -EBUSY. Other tasks block on the mutex.
+ *
+ * Return: 0 on success, -EBUSY if nested.
+ */
+int teelog_ledger_begin(void);
+
+/**
+ * teelog_ledger_end() - Release the lifecycle lock taken by begin()
+ */
+void teelog_ledger_end(void);
+
+/**
+ * teelog_ledger_record() - Allocate a generation and register one log page slot
+ * @pa:		Physical address of the pages (linear-map backed)
+ * @size:	Byte size of the allocation
+ * @order:	get_order(size) used for free_pages
+ * @generation:	Output: newly allocated monotonic generation
+ *
+ * Caller must hold teelog_ledger_begin(). Under the ledger mutex: allocate the
+ * next generation and occupy the single slot. Non-empty slot → -EBUSY;
+ * generation space exhausted → -ENOSPC. On success the ledger owns the pages;
+ * on failure the caller still owns them and must free.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int teelog_ledger_record(u64 pa, u32 size, u32 order, u32 *generation);
+
+/**
+ * teelog_ledger_lookup() - Look up a recorded allocation by generation
+ * @generation:	Allocation id
+ * @pa:		Optional output PA
+ * @size:	Optional output size
+ * @order:	Optional output order
+ * @isolated:	Optional output: true if marked isolated after lost contact
+ *
+ * Caller must hold teelog_ledger_begin().
+ *
+ * Return: 0 on success, -ENOENT if no matching entry, -EPERM without begin.
+ */
+int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
+			 bool *isolated);
+
+/**
+ * teelog_ledger_mark_isolated() - Mark the slot isolated (lost TEE contact)
+ * @generation:	Allocation id that must match the occupied slot
+ *
+ * Caller must hold teelog_ledger_begin(). Does not free pages; preserves
+ * pa/size/order/generation. Used when UNREGISTER/stop-write is unconfirmed.
+ *
+ * Return: 0 on success, -ENOENT if no match, -EPERM without begin.
+ */
+int teelog_ledger_mark_isolated(u32 generation);
+
+/**
+ * teelog_ledger_release_once() - Match, free_pages, and clear the slot
+ * @generation:	Allocation id that must match
+ *
+ * Caller must hold teelog_ledger_begin() and already have stop-write evidence;
+ * ledger match alone is not that evidence. Frees via __va(pa) + free_pages.
+ * Concurrent callers: exactly one succeeds; others get -ENOENT.
+ *
+ * Return: 0 on success, -ENOENT if no match, -EPERM without begin.
+ */
+int teelog_ledger_release_once(u32 generation);
+
+#if IS_ENABLED(CONFIG_TEELOG_LEDGER_KUNIT_TEST)
+void teelog_ledger_debug_set_next_generation(u32 next);
+u32 teelog_ledger_debug_get_next_generation(void);
+#endif
+#endif /* CONFIG_OPTEE_TEELOG */
+
 #endif /*__TEE_DRV_H*/

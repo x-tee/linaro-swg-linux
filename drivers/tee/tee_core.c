@@ -8,10 +8,14 @@
 #include <linux/cdev.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/idr.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/tee_core.h>
 #include <linux/uaccess.h>
 #include <crypto/sha1.h>
@@ -1404,6 +1408,205 @@ const struct bus_type tee_bus_type = {
 	.uevent		= tee_client_device_uevent,
 };
 EXPORT_SYMBOL_GPL(tee_bus_type);
+
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+
+/*
+ * Resident single-slot teelog page ledger (design §6). Lives in tee.o so it
+ * survives optee.ko unload. Generation counter is monotonic for this boot.
+ *
+ * Lock order (outer → inner): life_mu (begin/end) → ledger_mu.
+ */
+
+struct teelog_ledger_slot {
+	bool occupied;
+	bool isolated;
+	u64 pa;
+	u32 size;
+	u32 order;
+	u32 generation;
+};
+
+static struct {
+	struct mutex life_mu;
+	struct mutex ledger_mu;
+	struct task_struct *life_owner;
+	/* Next generation to hand out; 0 means exhausted after UINT32_MAX. */
+	u32 next_gen;
+	struct teelog_ledger_slot slot;
+} teelog_ledger = {
+	.life_mu = __MUTEX_INITIALIZER(teelog_ledger.life_mu),
+	.ledger_mu = __MUTEX_INITIALIZER(teelog_ledger.ledger_mu),
+	.next_gen = 1,
+};
+
+static bool teelog_ledger_life_held(void)
+{
+	return READ_ONCE(teelog_ledger.life_owner) == current;
+}
+
+int teelog_ledger_begin(void)
+{
+	if (teelog_ledger_life_held())
+		return -EBUSY;
+
+	mutex_lock(&teelog_ledger.life_mu);
+	WRITE_ONCE(teelog_ledger.life_owner, current);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_begin);
+
+void teelog_ledger_end(void)
+{
+	if (!teelog_ledger_life_held()) {
+		WARN(1, "teelog_ledger_end without matching begin\n");
+		return;
+	}
+
+	WRITE_ONCE(teelog_ledger.life_owner, NULL);
+	mutex_unlock(&teelog_ledger.life_mu);
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_end);
+
+int teelog_ledger_record(u64 pa, u32 size, u32 order, u32 *generation)
+{
+	u32 gen;
+	int rc = 0;
+
+	if (!generation || !size)
+		return -EINVAL;
+	if (!teelog_ledger_life_held())
+		return -EPERM;
+
+	mutex_lock(&teelog_ledger.ledger_mu);
+
+	if (teelog_ledger.slot.occupied) {
+		rc = -EBUSY;
+		goto out;
+	}
+	if (teelog_ledger.next_gen == 0) {
+		rc = -ENOSPC;
+		goto out;
+	}
+
+	gen = teelog_ledger.next_gen;
+	if (teelog_ledger.next_gen == U32_MAX)
+		teelog_ledger.next_gen = 0;
+	else
+		teelog_ledger.next_gen++;
+
+	teelog_ledger.slot.occupied = true;
+	teelog_ledger.slot.isolated = false;
+	teelog_ledger.slot.pa = pa;
+	teelog_ledger.slot.size = size;
+	teelog_ledger.slot.order = order;
+	teelog_ledger.slot.generation = gen;
+	*generation = gen;
+
+out:
+	mutex_unlock(&teelog_ledger.ledger_mu);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_record);
+
+int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
+			 bool *isolated)
+{
+	int rc = -ENOENT;
+
+	if (!generation)
+		return -EINVAL;
+	if (!teelog_ledger_life_held())
+		return -EPERM;
+
+	mutex_lock(&teelog_ledger.ledger_mu);
+	if (teelog_ledger.slot.occupied &&
+	    teelog_ledger.slot.generation == generation) {
+		if (pa)
+			*pa = teelog_ledger.slot.pa;
+		if (size)
+			*size = teelog_ledger.slot.size;
+		if (order)
+			*order = teelog_ledger.slot.order;
+		if (isolated)
+			*isolated = teelog_ledger.slot.isolated;
+		rc = 0;
+	}
+	mutex_unlock(&teelog_ledger.ledger_mu);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_lookup);
+
+int teelog_ledger_mark_isolated(u32 generation)
+{
+	int rc = -ENOENT;
+
+	if (!generation)
+		return -EINVAL;
+	if (!teelog_ledger_life_held())
+		return -EPERM;
+
+	mutex_lock(&teelog_ledger.ledger_mu);
+	if (teelog_ledger.slot.occupied &&
+	    teelog_ledger.slot.generation == generation) {
+		teelog_ledger.slot.isolated = true;
+		rc = 0;
+	}
+	mutex_unlock(&teelog_ledger.ledger_mu);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_mark_isolated);
+
+int teelog_ledger_release_once(u32 generation)
+{
+	int rc = -ENOENT;
+
+	if (!generation)
+		return -EINVAL;
+	if (!teelog_ledger_life_held())
+		return -EPERM;
+
+	/*
+	 * Design §6: match, free_pages, and clear the slot under the same
+	 * ledger mutex (caller already holds life_mu).
+	 */
+	mutex_lock(&teelog_ledger.ledger_mu);
+	if (teelog_ledger.slot.occupied &&
+	    teelog_ledger.slot.generation == generation) {
+		u64 pa = teelog_ledger.slot.pa;
+		u32 order = teelog_ledger.slot.order;
+
+		memset(&teelog_ledger.slot, 0, sizeof(teelog_ledger.slot));
+		free_pages((unsigned long)__va(pa), order);
+		rc = 0;
+	}
+	mutex_unlock(&teelog_ledger.ledger_mu);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_release_once);
+
+#if IS_ENABLED(CONFIG_TEELOG_LEDGER_KUNIT_TEST)
+void teelog_ledger_debug_set_next_generation(u32 next)
+{
+	mutex_lock(&teelog_ledger.ledger_mu);
+	teelog_ledger.next_gen = next;
+	mutex_unlock(&teelog_ledger.ledger_mu);
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_debug_set_next_generation);
+
+u32 teelog_ledger_debug_get_next_generation(void)
+{
+	u32 v;
+
+	mutex_lock(&teelog_ledger.ledger_mu);
+	v = teelog_ledger.next_gen;
+	mutex_unlock(&teelog_ledger.ledger_mu);
+	return v;
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_debug_get_next_generation);
+#endif /* CONFIG_TEELOG_LEDGER_KUNIT_TEST */
+
+#endif /* CONFIG_OPTEE_TEELOG */
 
 static int __init tee_init(void)
 {
