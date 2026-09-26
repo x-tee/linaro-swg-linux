@@ -67,6 +67,9 @@
 #define TEELOG_RING_PROTO_VERSION		1U
 #define TEELOG_SEQ_OFFSET			24U
 #define TEELOG_SEQ_SIZE				8U
+#define TEELOG_DROPPED_INDEX			4U
+#define TEELOG_DROPPED_OFFSET			32U
+/* Producer losses: boot-cumulative, saturate at UINT32_MAX, published under seq. */
 
 /*
  * real_len is s16 (OpenTrustee TEE writer). Reference Linux tlogger.c used
@@ -108,6 +111,9 @@ static_assert(offsetof(struct teelog_buffer_flag, reserved[2]) ==
 	      TEELOG_SEQ_OFFSET);
 static_assert(TEELOG_SEQ_OFFSET % 8 == 0);
 static_assert(TEELOG_DEFAULT_MAX_LEN == 261924U);
+
+static_assert(offsetof(struct teelog_buffer_flag, reserved[TEELOG_DROPPED_INDEX]) ==
+	      TEELOG_DROPPED_OFFSET);
 
 typedef u64 __attribute__((__may_alias__)) teelog_seq_word_t;
 
@@ -196,6 +202,9 @@ struct teelog_caps {
 
 /*
  * Global producer snapshot (not per-fd reader state).
+ * dropped comes from flag.reserved[TEELOG_DROPPED_INDEX] in the same seq
+ * snapshot. TEE keeps the authoritative boot-cumulative counter in secure
+ * memory, carries it across registration changes, and saturates at U32_MAX.
  *   seq / last_pos / write_loops — shared ring producer header
  *   dropped — losses the producer can observe by itself: records discarded by
  *             migration truncation and by early-ring overflow before
@@ -241,6 +250,10 @@ struct teelog_stats {
  *   int teelog_ledger_mark_isolated(u32 generation);
  *       Under ledger mutex: set isolated on matching slot. Preserves
  *       pa/size/order/generation. Lost-contact path only.
+ *
+ *   int teelog_ledger_snapshot(struct teelog_ledger_entry *entry);
+ *       Discovers the resident slot without a generation; caller holds begin().
+ *       Empty snapshot is all zero. Nonempty includes generation and ownership.
  *
  *   int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
  *			      bool *isolated);

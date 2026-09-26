@@ -324,6 +324,35 @@ struct tee_client_driver {
 
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 /**
+ * struct teelog_ledger_entry - Resident allocation snapshot (not a wire ABI)
+ * @pa: Physical address recorded by the allocating driver
+ * @size: Requested log size
+ * @order: Original page allocation order
+ * @generation: Resident allocation id, needed for matching recovery operations
+ * @occupied: False means the snapshot is empty and all fields are zero
+ * @isolated: Stop-write was not confirmed
+ */
+struct teelog_ledger_entry {
+	u64 pa;
+	u32 size;
+	u32 order;
+	u32 generation;
+	bool occupied;
+	bool isolated;
+};
+
+/**
+ * teelog_ledger_snapshot() - Discover the resident slot without a generation
+ * @entry: Required output snapshot; zeroed if the slot is empty
+ *
+ * Caller must hold begin through query/stop-write/release, not merely snapshot.
+ * A snapshot proves ownership only; release still needs stop-write evidence.
+ *
+ * Return: 0 (including empty), -EINVAL for NULL, -EPERM without begin.
+ */
+int teelog_ledger_snapshot(struct teelog_ledger_entry *entry);
+
+/**
  * teelog_ledger_begin() - Take the resident teelog lifecycle lock
  *
  * Serialises record→REGISTER and lookup→UNREGISTER→release_once transactions.
@@ -392,10 +421,6 @@ int teelog_ledger_mark_isolated(u32 generation);
  */
 int teelog_ledger_release_once(u32 generation);
 
-#if IS_ENABLED(CONFIG_TEELOG_LEDGER_KUNIT_TEST)
-void teelog_ledger_debug_set_next_generation(u32 next);
-u32 teelog_ledger_debug_get_next_generation(void);
-#endif
 #endif /* CONFIG_OPTEE_TEELOG */
 
 #endif /*__TEE_DRV_H*/

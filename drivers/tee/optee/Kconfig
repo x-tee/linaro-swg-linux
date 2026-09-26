@@ -33,7 +33,7 @@ config OPTEE_STATIC_PROTMEM_POOL
 
 config OPTEE_TEELOG
 	bool "OP-TEE TEE log export (resident page ledger)"
-	depends on TEE
+	depends on TEE = y
 	help
 	  Build the resident teelog page-allocation ledger into the TEE
 	  framework core (tee.o). The ledger survives optee.ko unload so a
