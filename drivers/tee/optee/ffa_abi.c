@@ -17,6 +17,7 @@
 #include "optee_private.h"
 #include "optee_ffa.h"
 #include "optee_rpc_cmd.h"
+#include "teelog.h"
 
 /*
  * This file implement the FF-A ABI used when communicating with secure world
@@ -861,6 +862,10 @@ static void notif_callback(int notify_id, void *cb_data)
 
 	if (notify_id == optee->ffa.bottom_half_value)
 		queue_work(optee->ffa.notif_wq, &optee->ffa.notif_work);
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	else if (optee_teelog_notif_handle(optee, notify_id))
+		; /* teelog consumed its async key */
+#endif
 	else
 		optee_notif_send(optee, notify_id);
 }
@@ -1065,6 +1070,7 @@ static int optee_ffa_probe(struct ffa_device *ffa_dev)
 
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 	mutex_init(&optee->teelog_slot_mu);
+	RCU_INIT_POINTER(optee->teelog_notif, NULL);
 #endif
 
 	pool = optee_ffa_shm_pool_alloc_pages();

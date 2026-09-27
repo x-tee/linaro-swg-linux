@@ -31,6 +31,7 @@
 #include "optee_private.h"
 #include "teelog.h"
 #include "teelog_internal.h"
+#include "teelog_priv.h"
 #include "teelog_protocol.h"
 
 /*
@@ -57,36 +58,22 @@ static DEFINE_MUTEX(teelog_fault_mu);
 static const int teelog_inject;
 #endif
 
-enum optee_teelog_state {
-	OPTEE_TEELOG_OFF = 0,
-	OPTEE_TEELOG_ACTIVE,
-	OPTEE_TEELOG_STOPPING,
-};
-
-struct optee_teelog {
-	struct kref kref;
-	/* state + ctx/session identity for U6; see file comment. */
-	struct mutex state_lock;
-	enum optee_teelog_state state;
-	struct optee *optee;
-	struct tee_context *ctx;
-	u32 session;
-	bool session_open;
-	u64 pa;
-	u32 size;
-	u32 order;
-	u32 generation;
-	u32 notif_id;
-};
-
 static const uuid_t teelog_pta_uuid =
 	UUID_INIT(0xb5a1c0de, 0x7e31, 0x4a9c,
 		  0x9f, 0x2e, 0x41, 0x58, 0x6d, 0x73, 0xa0, 0x11);
+
+static int teelog_stop_instance_locked(struct optee *optee,
+				       struct optee_teelog *tl);
 
 static void teelog_release(struct kref *kref)
 {
 	struct optee_teelog *tl = container_of(kref, struct optee_teelog, kref);
 
+	/*
+	 * Safety net for paths that drop the last ref without an explicit
+	 * teelog_dev_shutdown() (e.g. fault orphan). Idempotent.
+	 */
+	teelog_dev_shutdown(tl);
 	mutex_destroy(&tl->state_lock);
 	kfree(tl);
 }
@@ -549,16 +536,32 @@ static int teelog_register_new_locked(struct optee *optee)
 	tl->session = session;
 	tl->session_open = true;
 	tl->pa = pa;
+	tl->va = va;
 	tl->size = size;
 	tl->order = order;
 	tl->generation = generation;
 	tl->notif_id = notif_id;
+	tl->tee_caps = caps;
 	tl->state = OPTEE_TEELOG_ACTIVE;
 	mutex_unlock(&tl->state_lock);
 
 	teelog_slot_publish(optee, tl);
 	pr_info("TEELOG_REGISTER_OK pa=0x%llx size=%u gen=%u notif=0x%x\n",
 		pa, size, generation, notif_id);
+
+	rc = teelog_dev_start(tl);
+	if (rc) {
+		/*
+		 * Design §5: device registration failure must still stop TEE
+		 * writes and reclaim pages — reuse the normal stop path.
+		 */
+		pr_err("TEELOG_DEV_START_FAIL (%d); stopping registration\n",
+		       rc);
+		tl = teelog_slot_take(optee);
+		if (tl)
+			teelog_stop_instance_locked(optee, tl);
+		return rc;
+	}
 	return 0;
 
 err_free_pages:
@@ -593,6 +596,9 @@ static int teelog_stop_instance_locked(struct optee *optee,
 	/* Keep ctx pointers until after UNREGISTER; cleared in detach. */
 	mutex_unlock(&tl->state_lock);
 
+	/* Forbid new opens / wake pollers before pages go away (§5–§6). */
+	teelog_dev_shutdown(tl);
+
 	if (!session_open || !ctx) {
 		teelog_ledger_mark_isolated(generation);
 		pr_warn("TEELOG_UNREGISTER_ISOLATED gen=%u (no session)\n",
@@ -603,6 +609,9 @@ static int teelog_stop_instance_locked(struct optee *optee,
 	cls = teelog_cmd_unregister(ctx, session, generation);
 	fate = teelog_pages_after_unregister(cls);
 	if (fate == TEELOG_PAGE_RELEASE) {
+		mutex_lock(&tl->state_lock);
+		tl->va = 0;
+		mutex_unlock(&tl->state_lock);
 		rc = teelog_ledger_release_once(generation);
 		if (rc)
 			pr_warn("stop: release_once failed (%d)\n", rc);
@@ -618,6 +627,7 @@ detach:
 	teelog_detach_tee(tl);
 	mutex_lock(&tl->state_lock);
 	tl->state = OPTEE_TEELOG_OFF;
+	tl->va = 0;
 	tl->optee = NULL;
 	mutex_unlock(&tl->state_lock);
 	optee_teelog_put(tl);
@@ -705,6 +715,18 @@ static int teelog_fault_orphan_locked(struct optee *optee)
 	tl->session_open = false;
 	generation = tl->generation;
 	tl->state = OPTEE_TEELOG_OFF;
+	/* Keep tl->optee until after teelog_dev_shutdown clears RCU notif. */
+	mutex_unlock(&tl->state_lock);
+
+	/*
+	 * Must cancel the 100 ms worker / misc / notif before put — orphan
+	 * intentionally skips UNREGISTER/page free, but the Linux device
+	 * side must still tear down or delayed_work UAFs the freed tl.
+	 */
+	teelog_dev_shutdown(tl);
+
+	mutex_lock(&tl->state_lock);
+	tl->va = 0;
 	tl->optee = NULL;
 	mutex_unlock(&tl->state_lock);
 

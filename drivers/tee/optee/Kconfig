@@ -57,11 +57,15 @@ config OPTEE_TEELOG_FAULT_INJECT
 
 config OPTEE_TEELOG_KUNIT_TEST
 	tristate "KUnit tests for teelog lifecycle state machine" if !KUNIT_ALL_TESTS
-	depends on OPTEE_TEELOG && KUNIT
+	depends on OPTEE_TEELOG && OPTEE && KUNIT
+	# Built-in tests need built-in optee (exported ring_read symbols).
+	depends on OPTEE=y || m
 	default KUNIT_ALL_TESTS
 	help
 	  Unit tests for teelog invoke classification, recovery decisions,
-	  page-fate mapping, and inject policy helpers. Does not require a
-	  live TEE and does not by itself enable runtime fault injection
-	  (see OPTEE_TEELOG_FAULT_INJECT). Decision-helper coverage is not
-	  a substitute for end-to-end fault-path resource accounting.
+	  page-fate mapping, inject policy helpers, and ring-reader catch-up.
+	  Links against symbols exported from the OP-TEE teelog objects; do
+	  not duplicate teelog_ring_read.o into this test module. Does not
+	  require a live TEE and does not by itself enable runtime fault
+	  injection (see OPTEE_TEELOG_FAULT_INJECT). Decision-helper coverage
+	  is not a substitute for end-to-end fault-path resource accounting.

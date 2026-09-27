@@ -38,6 +38,14 @@ struct optee_teelog *optee_teelog_get(struct optee *optee);
  */
 void optee_teelog_put(struct optee_teelog *tl);
 
+/**
+ * optee_teelog_notif_handle() - IRQ-path teelog async notif consumer
+ *
+ * Returns true if @value was this component's key (caller must not also
+ * deliver it to the generic OP-TEE notif wait queue).
+ */
+bool optee_teelog_notif_handle(struct optee *optee, u32 value);
+
 #else /* !CONFIG_OPTEE_TEELOG */
 
 static inline void optee_teelog_init(struct optee *optee)
@@ -55,6 +63,11 @@ static inline struct optee_teelog *optee_teelog_get(struct optee *optee)
 
 static inline void optee_teelog_put(struct optee_teelog *tl)
 {
+}
+
+static inline bool optee_teelog_notif_handle(struct optee *optee, u32 value)
+{
+	return false;
 }
 
 #endif /* CONFIG_OPTEE_TEELOG */

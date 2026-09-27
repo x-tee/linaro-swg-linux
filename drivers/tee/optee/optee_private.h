@@ -8,6 +8,7 @@
 
 #include <linux/arm-smccc.h>
 #include <linux/notifier.h>
+#include <linux/rcupdate.h>
 #include <linux/rhashtable.h>
 #include <linux/rpmb.h>
 #include <linux/semaphore.h>
@@ -259,6 +260,11 @@ struct optee {
 	struct mutex teelog_slot_mu;
 	/* Refcounted teelog instance; NULL when inactive or isolated. */
 	struct optee_teelog *teelog;
+	/*
+	 * RCU-published target for async-notif IRQ dispatch (design §5.1).
+	 * Cleared with synchronize_rcu before the instance may be freed.
+	 */
+	struct optee_teelog __rcu *teelog_notif;
 #endif
 };
 

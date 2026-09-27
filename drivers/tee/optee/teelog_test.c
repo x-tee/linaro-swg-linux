@@ -9,9 +9,12 @@
 #include <kunit/test.h>
 #include <linux/errno.h>
 #include <linux/module.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 #include "teelog_internal.h"
+#include "teelog_protocol.h"
+#include "teelog_ring_read.h"
 
 #define TEEC_SUCCESS			0x00000000U
 #define TEEC_ERROR_ACCESS_DENIED	0xFFFF0001U
@@ -224,6 +227,163 @@ static void test_reject_path_may_release_unknown_must_not(struct kunit *test)
 			teelog_pages_after_unregister(TEELOG_COMM_UNKNOWN));
 }
 
+static void test_reader_catchup_unsaturated_lap(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 100,
+		.r_loops = 1,
+		.r_seq = 10,
+		.r_serial_valid = true,
+		.r_serial = 5,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 200,
+		.write_loops = 3,
+		.max_len = 1000,
+		.seq = 20,
+	};
+
+	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 200U, pos.r_off);
+	KUNIT_EXPECT_EQ(test, 2U, pos.r_loops);
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+}
+
+static void test_reader_catchup_saturated_wrap(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 800,
+		.r_loops = U32_MAX,
+		.r_seq = 100,
+		.r_serial_valid = true,
+		.r_serial = 1,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 100,
+		.write_loops = U32_MAX,
+		.max_len = 1000,
+		.seq = 110,
+	};
+
+	/* CR-004: equal saturated loops + last_pos < r_off ⇒ lapped. */
+	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 100U, pos.r_off);
+	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+}
+
+static void test_reader_catchup_saturated_same_off(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 256,
+		.r_loops = U32_MAX,
+		.r_seq = 40,
+		.r_serial_valid = true,
+		.r_serial = 1,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 256,
+		.write_loops = U32_MAX,
+		.max_len = 1024,
+		.seq = 80,
+	};
+
+	/*
+	 * Full ring back to the same offset under saturation: loops equal and
+	 * last_pos == r_off must not look like "no data".
+	 */
+	KUNIT_EXPECT_TRUE(test, teelog_reader_has_data(&pos, &snap));
+	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 256U, pos.r_off);
+	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
+	KUNIT_EXPECT_EQ(test, 80ULL, pos.r_seq);
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_TRUE(test, teelog_reader_has_data(&pos, &snap));
+}
+
+static void test_reader_catchup_seq_threshold(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 10,
+		.r_loops = 0,
+		.r_seq = 0,
+		.r_serial_valid = true,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 50,
+		.write_loops = 0,
+		.max_len = 1000,
+		.seq = 1ULL << 32,
+	};
+
+	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 0U, pos.r_off);
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+}
+
+static void test_serial_accept_baseline(struct kunit *test)
+{
+	struct teelog_reader_pos pos = { .r_serial_valid = false };
+
+	/* accept does not mutate; commit publishes the baseline. */
+	KUNIT_EXPECT_TRUE(test, teelog_serial_accept(&pos, 10));
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+	teelog_serial_commit(&pos, 10);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_EQ(test, 10U, pos.r_serial);
+	KUNIT_EXPECT_FALSE(test, teelog_serial_accept(&pos, 10));
+	KUNIT_EXPECT_TRUE(test, teelog_serial_accept(&pos, 11));
+	teelog_serial_commit(&pos, 20);
+	KUNIT_EXPECT_FALSE(test, teelog_serial_accept(&pos, 15));
+	KUNIT_EXPECT_TRUE(test, teelog_serial_accept(&pos, 21));
+}
+
+static void test_next_record_reports_found_off(struct kunit *test)
+{
+	/* Minimal synthetic ring: flag + body with a gap then one item. */
+	u8 raw[TEELOG_BUFFER_FLAG_SIZE + 512];
+	struct teelog_buffer *ring = (struct teelog_buffer *)raw;
+	struct teelog_item *item;
+	u8 stage[TEELOG_ITEM_MAX_LEN];
+	u32 found = 0, stage_len = 0;
+	u32 body = 64;
+	int rc;
+
+	memset(raw, 0, sizeof(raw));
+	teelog_ctrl_store_u32(&ring->flag.max_len, 512);
+	teelog_ctrl_store_u32(&ring->flag.last_pos, 384);
+	teelog_ctrl_store_u32(&ring->flag.reserved0, TEELOG_RING_MAGIC);
+	teelog_ctrl_store_u32(&ring->flag.reserved[0], TEELOG_RING_PROTO_VERSION);
+	teelog_seq_store(&ring->flag, 2);
+
+	/* Invalid gap at 0..255; valid 128 B record at 256. */
+	item = (struct teelog_item *)(ring->buffer_start + 256);
+	item->magic = TEELOG_ITEM_MAGIC;
+	item->buffer_len = body;
+	item->real_len = (s16)body;
+	item->serial_no = 7;
+
+	rc = teelog_next_record_stable(ring, sizeof(raw), 0, 384, stage,
+				       &found, &stage_len, 2);
+	KUNIT_EXPECT_EQ(test, 0, rc);
+	KUNIT_EXPECT_EQ(test, 256U, found);
+	KUNIT_EXPECT_EQ(test, TEELOG_ITEM_HDR_SIZE + body, stage_len);
+
+	/* Residual past last_pos must stay outside the window. */
+	item = (struct teelog_item *)(ring->buffer_start + 384);
+	item->magic = TEELOG_ITEM_MAGIC;
+	item->buffer_len = body;
+	item->real_len = (s16)body;
+	item->serial_no = 8;
+	rc = teelog_next_record_stable(ring, sizeof(raw), 384, 384, stage,
+				       &found, &stage_len, 2);
+	KUNIT_EXPECT_EQ(test, -ENOENT, rc);
+	rc = teelog_next_record_stable(ring, sizeof(raw), 0, 384, stage,
+				       &found, &stage_len, 2);
+	KUNIT_EXPECT_EQ(test, 0, rc);
+	KUNIT_EXPECT_EQ(test, 256U, found);
+}
+
 static struct kunit_case teelog_lifecycle_cases[] = {
 	KUNIT_CASE(test_classify_ok),
 	KUNIT_CASE(test_classify_linux_error_unknown),
@@ -241,6 +401,12 @@ static struct kunit_case teelog_lifecycle_cases[] = {
 	KUNIT_CASE(test_inject_corrupt_reg_reply_breaks_match),
 	KUNIT_CASE(test_inject_post_only_unknown),
 	KUNIT_CASE(test_reject_path_may_release_unknown_must_not),
+	KUNIT_CASE(test_reader_catchup_unsaturated_lap),
+	KUNIT_CASE(test_reader_catchup_saturated_wrap),
+	KUNIT_CASE(test_reader_catchup_saturated_same_off),
+	KUNIT_CASE(test_reader_catchup_seq_threshold),
+	KUNIT_CASE(test_serial_accept_baseline),
+	KUNIT_CASE(test_next_record_reports_found_off),
 	{}
 };
 

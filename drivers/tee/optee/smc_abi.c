@@ -1065,6 +1065,10 @@ static irqreturn_t irq_handler(struct optee *optee)
 
 		if (value == OPTEE_SMC_ASYNC_NOTIF_VALUE_DO_BOTTOM_HALF)
 			do_bottom_half = true;
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+		else if (optee_teelog_notif_handle(optee, value))
+			; /* teelog consumed its async key */
+#endif
 		else
 			optee_notif_send(optee, value);
 	} while (value_pending);
@@ -1826,6 +1830,7 @@ static int optee_probe(struct platform_device *pdev)
 
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 	mutex_init(&optee->teelog_slot_mu);
+	RCU_INIT_POINTER(optee->teelog_notif, NULL);
 #endif
 
 	optee->ops = &optee_ops;
