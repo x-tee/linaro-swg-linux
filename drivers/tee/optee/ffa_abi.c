@@ -956,6 +956,9 @@ static void optee_ffa_remove(struct ffa_device *ffa_dev)
 	mutex_destroy(&optee->ffa.mutex);
 	rhashtable_free_and_destroy(&optee->ffa.global_ids, rh_free_fn, NULL);
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_destroy(&optee->teelog_slot_mu);
+#endif
 	kfree(optee);
 }
 
@@ -1060,6 +1063,10 @@ static int optee_ffa_probe(struct ffa_device *ffa_dev)
 	if (!optee)
 		return -ENOMEM;
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_init(&optee->teelog_slot_mu);
+#endif
+
 	pool = optee_ffa_shm_pool_alloc_pages();
 	if (IS_ERR(pool)) {
 		rc = PTR_ERR(pool);
@@ -1163,6 +1170,9 @@ err_unreg_teedev:
 err_free_shm_pool:
 	tee_shm_pool_free(pool);
 err_free_optee:
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_destroy(&optee->teelog_slot_mu);
+#endif
 	kfree(optee);
 	return rc;
 }

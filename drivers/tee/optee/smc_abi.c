@@ -30,6 +30,7 @@
 #include "optee_private.h"
 #include "optee_smc.h"
 #include "optee_rpc_cmd.h"
+#include "teelog.h"
 #include <linux/kmemleak.h>
 #define CREATE_TRACE_POINTS
 #include "optee_trace.h"
@@ -1504,6 +1505,9 @@ static void optee_smc_remove(struct platform_device *pdev)
 {
 	struct optee *optee = platform_get_drvdata(pdev);
 
+	/* Stop teelog before notif/context/pool teardown (design §6). */
+	optee_teelog_stop(optee);
+
 	/*
 	 * Ask OP-TEE to free all cached shared memory objects to decrease
 	 * reference counters and also avoid wild pointers in secure world
@@ -1519,6 +1523,9 @@ static void optee_smc_remove(struct platform_device *pdev)
 	if (optee->smc.memremaped_shm)
 		memunmap(optee->smc.memremaped_shm);
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_destroy(&optee->teelog_slot_mu);
+#endif
 	kfree(optee);
 }
 
@@ -1532,6 +1539,8 @@ static void optee_smc_remove(struct platform_device *pdev)
 static void optee_shutdown(struct platform_device *pdev)
 {
 	struct optee *optee = platform_get_drvdata(pdev);
+
+	optee_teelog_stop(optee);
 
 	if (!optee->rpc_param_count)
 		optee_disable_shm_cache(optee);
@@ -1815,6 +1824,10 @@ static int optee_probe(struct platform_device *pdev)
 		goto err_free_shm_pool;
 	}
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_init(&optee->teelog_slot_mu);
+#endif
+
 	optee->ops = &optee_ops;
 	optee->smc.invoke_fn = invoke_fn;
 	optee->smc.sec_caps = sec_caps;
@@ -1907,6 +1920,12 @@ static int optee_probe(struct platform_device *pdev)
 	if (optee->smc.sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
 		pr_info("dynamic shared memory is enabled\n");
 
+	/*
+	 * Teelog REGISTER after context/call queue/shm are ready. Failures
+	 * never abort OP-TEE probe (design §5–§6 / U5).
+	 */
+	optee_teelog_init(optee);
+
 	rc = optee_enumerate_devices(PTA_CMD_GET_DEVICES);
 	if (rc)
 		goto err_disable_shm_cache;
@@ -1919,6 +1938,7 @@ static int optee_probe(struct platform_device *pdev)
 	return 0;
 
 err_disable_shm_cache:
+	optee_teelog_stop(optee);
 	if (!optee->rpc_param_count)
 		optee_disable_shm_cache(optee);
 	optee_smc_notif_uninit_irq(optee);
@@ -1938,6 +1958,9 @@ err_unreg_supp_teedev:
 err_unreg_teedev:
 	tee_device_unregister(optee->teedev);
 err_free_optee:
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	mutex_destroy(&optee->teelog_slot_mu);
+#endif
 	kfree(optee);
 err_free_shm_pool:
 	tee_shm_pool_free(pool);

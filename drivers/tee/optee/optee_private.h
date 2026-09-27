@@ -170,6 +170,7 @@ struct optee_ffa {
 };
 
 struct optee;
+struct optee_teelog;
 
 /**
  * struct optee_ops - OP-TEE driver internal operations
@@ -249,6 +250,16 @@ struct optee {
 	bool in_kernel_rpmb_routing;
 	struct work_struct scan_bus_work;
 	struct work_struct rpmb_scan_bus_work;
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	/*
+	 * teelog_slot_mu: publish / clear / get of @teelog pointer.
+	 * Must be held while taking a kref on *teelog so get() cannot race
+	 * free after stop clears the slot.
+	 */
+	struct mutex teelog_slot_mu;
+	/* Refcounted teelog instance; NULL when inactive or isolated. */
+	struct optee_teelog *teelog;
+#endif
 };
 
 struct optee_session {

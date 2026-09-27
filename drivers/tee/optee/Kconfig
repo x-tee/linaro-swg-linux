@@ -32,11 +32,36 @@ config OPTEE_STATIC_PROTMEM_POOL
 	default y
 
 config OPTEE_TEELOG
-	bool "OP-TEE TEE log export (resident page ledger)"
+	bool "OP-TEE TEE log export (resident ledger + lifecycle)"
 	depends on TEE = y
 	help
 	  Build the resident teelog page-allocation ledger into the TEE
-	  framework core (tee.o). The ledger survives optee.ko unload so a
-	  later probe can safely reclaim log pages. Selecting this does not
+	  framework core (tee.o) and, when CONFIG_OPTEE is enabled, the
+	  OP-TEE driver lifecycle that allocates REE pages, REGISTER /
+	  UNREGISTER via the REE_KERNEL PTA, and recovers isolated slots
+	  on later probe. The ledger survives optee.ko unload so a later
+	  probe can safely reclaim log pages. Selecting this does not
 	  require CONFIG_OPTEE=y; OP-TEE may still be built as a module.
 	  The ledger is a single slot: only one log allocation at a time.
+
+config OPTEE_TEELOG_FAULT_INJECT
+	bool "OP-TEE teelog PTA fault injection (test builds)"
+	depends on OPTEE_TEELOG && OPTEE
+	default n
+	help
+	  Expose module parameter optee.inject on the OP-TEE driver for
+	  controlled REGISTER/UNREGISTER result injection. Independent of
+	  whether teelog KUnit is built-in (y) or modular (m). REJECTED is
+	  applied before the real invoke; post-call inject may only force
+	  UNKNOWN. Leave disabled for production images.
+
+config OPTEE_TEELOG_KUNIT_TEST
+	tristate "KUnit tests for teelog lifecycle state machine" if !KUNIT_ALL_TESTS
+	depends on OPTEE_TEELOG && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for teelog invoke classification, recovery decisions,
+	  page-fate mapping, and inject policy helpers. Does not require a
+	  live TEE and does not by itself enable runtime fault injection
+	  (see OPTEE_TEELOG_FAULT_INJECT). Decision-helper coverage is not
+	  a substitute for end-to-end fault-path resource accounting.
