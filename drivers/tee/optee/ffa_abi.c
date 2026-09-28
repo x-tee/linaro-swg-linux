@@ -951,6 +951,9 @@ static void optee_ffa_remove(struct ffa_device *ffa_dev)
 	struct optee *optee = ffa_dev_get_drvdata(ffa_dev);
 	u32 bottom_half_id = optee->ffa.bottom_half_value;
 
+	/* Stop teelog before notif/context/pool teardown (design §6). */
+	optee_teelog_stop(optee);
+
 	if (bottom_half_id != U32_MAX) {
 		ffa_dev->ops->notifier_ops->notify_relinquish(ffa_dev,
 							      bottom_half_id);
@@ -1143,9 +1146,15 @@ static int optee_ffa_probe(struct ffa_device *ffa_dev)
 	if (optee_ffa_protmem_pool_init(optee, sec_caps))
 		pr_info("Protected memory service not available\n");
 
+	/*
+	 * Teelog REGISTER after context/call queue/shm are ready. Failures
+	 * never abort OP-TEE probe (design §5–§6 / U5).
+	 */
+	optee_teelog_init(optee);
+
 	rc = optee_enumerate_devices(PTA_CMD_GET_DEVICES);
 	if (rc)
-		goto err_unregister_devices;
+		goto err_teelog_stop;
 
 	INIT_WORK(&optee->rpmb_scan_bus_work, optee_bus_scan_rpmb);
 	optee->rpmb_intf.notifier_call = optee_rpmb_intf_rdev;
@@ -1154,6 +1163,8 @@ static int optee_ffa_probe(struct ffa_device *ffa_dev)
 	pr_info("initialized driver\n");
 	return 0;
 
+err_teelog_stop:
+	optee_teelog_stop(optee);
 err_unregister_devices:
 	optee_unregister_devices();
 	if (optee->ffa.bottom_half_value != U32_MAX)

@@ -43,6 +43,13 @@ config OPTEE_TEELOG
 	  probe can safely reclaim log pages. Selecting this does not
 	  require CONFIG_OPTEE=y; OP-TEE may still be built as a module.
 	  The ledger is a single slot: only one log allocation at a time.
+	  A read-only /sys/kernel/teelog_ledger file (0444) reports
+	  occupancy, generation, size, order, next_gen and the cumulative
+	  recorded_pages/freed_pages counters (both use 1<<order: record()
+	  and free_pages() respectively) so a later probe or
+	  userspace test can inspect the slot after optee.ko unload. It
+	  does not expose PA (design: PA stays in-kernel) and is not a
+	  release or generation-reset API.
 
 config OPTEE_TEELOG_FAULT_INJECT
 	bool "OP-TEE teelog PTA fault injection (test builds)"
@@ -53,7 +60,10 @@ config OPTEE_TEELOG_FAULT_INJECT
 	  controlled REGISTER/UNREGISTER result injection. Independent of
 	  whether teelog KUnit is built-in (y) or modular (m). REJECTED is
 	  applied before the real invoke; post-call inject may only force
-	  UNKNOWN. Leave disabled for production images.
+	  UNKNOWN. Also creates root-only /sys/kernel/teelog_ledger_pa
+	  (0400) so isolate tests can compare PA across rmmod without
+	  putting PA on the production 0444 occupancy file. Leave
+	  disabled for production images.
 
 config OPTEE_TEELOG_KUNIT_TEST
 	tristate "KUnit tests for teelog lifecycle state machine" if !KUNIT_ALL_TESTS

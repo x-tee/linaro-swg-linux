@@ -248,6 +248,8 @@ static void test_record_lookup_release(struct kunit *test)
 	}
 	teelog_ctx_note_owned(&c, gen);
 	KUNIT_EXPECT_NE(test, 0U, gen);
+	KUNIT_EXPECT_EQ(test, 1ULL, test_ledger.pages_recorded);
+	KUNIT_EXPECT_EQ(test, 0ULL, test_ledger.pages_freed);
 
 	KUNIT_EXPECT_EQ(test, 0,
 			test_ledger_lookup(gen, &pa, &size, &order, &isolated));
@@ -258,9 +260,91 @@ static void test_record_lookup_release(struct kunit *test)
 			test_ledger_record(pa, PAGE_SIZE, order, &gen2));
 
 	teelog_ctx_expect_release(test, &c, gen);
+	KUNIT_EXPECT_EQ(test, test_ledger.pages_recorded,
+			test_ledger.pages_freed);
+	KUNIT_EXPECT_EQ(test, 1ULL, test_ledger.pages_freed);
 	KUNIT_EXPECT_EQ(test, -ENOENT, test_ledger_release_once(gen));
 	KUNIT_EXPECT_EQ(test, -ENOENT,
 			test_ledger_lookup(gen, NULL, NULL, NULL, NULL));
+	teelog_ctx_end_life(&c);
+out:
+	teelog_ctx_unwind(&c);
+}
+
+static void test_record_rejects_unaligned_size(struct kunit *test)
+{
+	struct teelog_ctx c = {};
+	unsigned long va;
+	u64 pa;
+	u32 order, gen = 0;
+	u64 recorded_before;
+
+	va = test_alloc_pages(&order, &pa);
+	if (!va) {
+		KUNIT_FAIL(test, "page alloc failed");
+		return;
+	}
+	teelog_ctx_note_pending(&c, va, order);
+
+	if (teelog_ctx_begin(&c)) {
+		KUNIT_FAIL(test, "begin failed");
+		goto out;
+	}
+	recorded_before = test_ledger.pages_recorded;
+	KUNIT_EXPECT_EQ(test, -EINVAL, test_ledger_record(pa, 1, 0, &gen));
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			test_ledger_record(pa, PAGE_SIZE + 1,
+					   get_order(PAGE_SIZE + 1), &gen));
+	KUNIT_EXPECT_EQ(test, 0U, gen);
+	KUNIT_EXPECT_EQ(test, recorded_before, test_ledger.pages_recorded);
+	KUNIT_EXPECT_EQ(test, 0ULL, test_ledger.pages_freed);
+	KUNIT_EXPECT_FALSE(test, test_ledger.slot.occupied);
+	teelog_ctx_end_life(&c);
+out:
+	teelog_ctx_unwind(&c);
+}
+
+/*
+ * Logical size of 3 pages is page-aligned but not a buddy size.
+ * get_order() yields 2, so record/release must count 4 pages.
+ */
+static void test_record_counts_buddy_pages(struct kunit *test)
+{
+	struct teelog_ctx c = {};
+	unsigned long va;
+	u64 pa;
+	u32 size = 3 * PAGE_SIZE;
+	u32 order = get_order(size);
+	u32 gen = 0;
+
+	KUNIT_ASSERT_EQ(test, 2U, order);
+
+	va = __get_free_pages(GFP_KERNEL | __GFP_ZERO, order);
+	if (!va) {
+		KUNIT_FAIL(test, "buddy alloc failed");
+		return;
+	}
+	pa = (u64)virt_to_phys((void *)va);
+	teelog_ctx_note_pending(&c, va, order);
+
+	if (teelog_ctx_begin(&c)) {
+		KUNIT_FAIL(test, "begin failed");
+		goto out;
+	}
+	if (test_ledger_record(pa, size, order, &gen)) {
+		KUNIT_FAIL(test, "record failed");
+		goto out;
+	}
+	teelog_ctx_note_owned(&c, gen);
+	KUNIT_EXPECT_EQ(test, 4ULL, test_ledger.pages_recorded);
+	KUNIT_EXPECT_EQ(test, 0ULL, test_ledger.pages_freed);
+	KUNIT_EXPECT_EQ(test, size, test_ledger.slot.size);
+	KUNIT_EXPECT_EQ(test, order, test_ledger.slot.order);
+
+	teelog_ctx_expect_release(test, &c, gen);
+	KUNIT_EXPECT_EQ(test, 4ULL, test_ledger.pages_freed);
+	KUNIT_EXPECT_EQ(test, test_ledger.pages_recorded,
+			test_ledger.pages_freed);
 	teelog_ctx_end_life(&c);
 out:
 	teelog_ctx_unwind(&c);
@@ -707,6 +791,8 @@ static struct kunit_case teelog_ledger_test_cases[] = {
 	KUNIT_CASE(test_begin_nested),
 	KUNIT_CASE(test_ops_require_begin),
 	KUNIT_CASE(test_record_lookup_release),
+	KUNIT_CASE(test_record_rejects_unaligned_size),
+	KUNIT_CASE(test_record_counts_buddy_pages),
 	KUNIT_CASE(test_wrong_generation),
 	KUNIT_CASE(test_isolated_preserved),
 	KUNIT_CASE(test_unwind_while_life_held),

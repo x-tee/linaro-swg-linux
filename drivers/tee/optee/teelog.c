@@ -856,6 +856,11 @@ void optee_teelog_stop(struct optee *optee)
 	mutex_lock(&teelog_fault_mu);
 	if (READ_ONCE(teelog_fault_host) == optee) {
 		WRITE_ONCE(teelog_fault_host, NULL);
+		/*
+		 * Close the crash-sim PTA session. PTA close may
+		 * auto-UNREGISTER, so rmmod after orphan does not prove
+		 * "TEE stayed registered until the next probe".
+		 */
 		teelog_fault_orphan_close();
 	}
 	mutex_unlock(&teelog_fault_mu);

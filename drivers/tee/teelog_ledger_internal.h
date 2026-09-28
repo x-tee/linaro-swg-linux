@@ -8,6 +8,7 @@
 #include <linux/gfp.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/tee_drv.h>
@@ -28,6 +29,13 @@ struct teelog_ledger_state {
 	/* Next generation to hand out; 0 means exhausted after UINT32_MAX. */
 	u32 next_gen;
 	struct teelog_ledger_slot slot;
+	/*
+	 * Buddy pages recorded vs pages passed to free_pages(). Both
+	 * counters use 1<<order, not size>>PAGE_SHIFT: get_order() rounds
+	 * a non-power-of-two page count up to the next buddy block.
+	 */
+	u64 pages_recorded;
+	u64 pages_freed;
 };
 
 static inline bool teelog_ledger_life_held(struct teelog_ledger_state *ledger)
@@ -64,7 +72,7 @@ static inline int teelog_ledger_do_record(struct teelog_ledger_state *ledger,
 	int rc = 0;
 
 	if (!generation || !size || !IS_ALIGNED(pa, PAGE_SIZE) ||
-	    order != get_order(size))
+	    !IS_ALIGNED(size, PAGE_SIZE) || order != get_order(size))
 		return -EINVAL;
 	if (!teelog_ledger_life_held(ledger))
 		return -EPERM;
@@ -93,6 +101,9 @@ static inline int teelog_ledger_do_record(struct teelog_ledger_state *ledger,
 	ledger->slot.order = order;
 	ledger->slot.generation = gen;
 	*generation = gen;
+	if (check_add_overflow(ledger->pages_recorded, 1ULL << order,
+			       &ledger->pages_recorded))
+		ledger->pages_recorded = U64_MAX;
 
 out:
 	mutex_unlock(&ledger->ledger_mu);
@@ -168,8 +179,12 @@ teelog_ledger_do_release_once(struct teelog_ledger_state *ledger,
 	    ledger->slot.generation == generation) {
 		u64 pa = ledger->slot.pa;
 		u32 order = ledger->slot.order;
+		u64 npages = 1ULL << order;
 
 		free_pages((unsigned long)__va(pa), order);
+		if (check_add_overflow(ledger->pages_freed, npages,
+				       &ledger->pages_freed))
+			ledger->pages_freed = U64_MAX;
 		memset(&ledger->slot, 0, sizeof(ledger->slot));
 		rc = 0;
 	}

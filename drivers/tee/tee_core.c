@@ -10,12 +10,14 @@
 #include <linux/fs.h>
 #include <linux/gfp.h>
 #include <linux/idr.h>
+#include <linux/kobject.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/sysfs.h>
 #include <linux/tee_core.h>
 #include <linux/uaccess.h>
 #include <crypto/sha1.h>
@@ -1470,6 +1472,86 @@ int teelog_ledger_snapshot(struct teelog_ledger_entry *entry)
 }
 EXPORT_SYMBOL_GPL(teelog_ledger_snapshot);
 
+/*
+ * Production occupancy snapshot for U8: query the resident slot after
+ * optee.ko unload. Does not take begin() and never frees pages. next_gen
+ * is shown so reload tests can prove the counter did not reset. PA is
+ * omitted: design §2.1 forbids exposing it to userspace.
+ */
+static ssize_t teelog_ledger_sysfs_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	struct teelog_ledger_slot slot;
+	u32 next_gen;
+	u64 pages_recorded;
+	u64 pages_freed;
+
+	(void)kobj;
+	(void)attr;
+	mutex_lock(&teelog_ledger.ledger_mu);
+	slot = teelog_ledger.slot;
+	next_gen = teelog_ledger.next_gen;
+	pages_recorded = teelog_ledger.pages_recorded;
+	pages_freed = teelog_ledger.pages_freed;
+	mutex_unlock(&teelog_ledger.ledger_mu);
+
+	return sysfs_emit(buf,
+			  "occupied=%u isolated=%u generation=%u size=%u order=%u next_gen=%u recorded_pages=%llu freed_pages=%llu\n",
+			  slot.occupied, slot.isolated, slot.generation,
+			  slot.size, slot.order, next_gen,
+			  pages_recorded, pages_freed);
+}
+
+static struct kobj_attribute teelog_ledger_attr =
+	__ATTR(teelog_ledger, 0444, teelog_ledger_sysfs_show, NULL);
+
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG_FAULT_INJECT)
+/*
+ * Test-only PA dump. 0400 so only root can read; not created on production
+ * images. Isolate/orphan reload tests compare generation+PA across rmmod.
+ */
+static ssize_t teelog_ledger_pa_sysfs_show(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   char *buf)
+{
+	struct teelog_ledger_slot slot;
+
+	(void)kobj;
+	(void)attr;
+	mutex_lock(&teelog_ledger.ledger_mu);
+	slot = teelog_ledger.slot;
+	mutex_unlock(&teelog_ledger.ledger_mu);
+
+	return sysfs_emit(buf, "occupied=%u generation=%u pa=0x%llx\n",
+			  slot.occupied, slot.generation, slot.pa);
+}
+
+static struct kobj_attribute teelog_ledger_pa_attr =
+	__ATTR(teelog_ledger_pa, 0400, teelog_ledger_pa_sysfs_show, NULL);
+#endif
+
+static void teelog_ledger_sysfs_init(void)
+{
+	int rc;
+
+	rc = sysfs_create_file(kernel_kobj, &teelog_ledger_attr.attr);
+	if (rc)
+		pr_warn("teelog ledger sysfs not created (%d)\n", rc);
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG_FAULT_INJECT)
+	rc = sysfs_create_file(kernel_kobj, &teelog_ledger_pa_attr.attr);
+	if (rc)
+		pr_warn("teelog ledger PA sysfs not created (%d)\n", rc);
+#endif
+}
+
+static void teelog_ledger_sysfs_exit(void)
+{
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG_FAULT_INJECT)
+	sysfs_remove_file(kernel_kobj, &teelog_ledger_pa_attr.attr);
+#endif
+	sysfs_remove_file(kernel_kobj, &teelog_ledger_attr.attr);
+}
+
 #endif /* CONFIG_OPTEE_TEELOG */
 
 static int __init tee_init(void)
@@ -1494,6 +1576,10 @@ static int __init tee_init(void)
 		goto out_unreg_chrdev;
 	}
 
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	teelog_ledger_sysfs_init();
+#endif
+
 	return 0;
 
 out_unreg_chrdev:
@@ -1506,6 +1592,9 @@ out_unreg_class:
 
 static void __exit tee_exit(void)
 {
+#if IS_ENABLED(CONFIG_OPTEE_TEELOG)
+	teelog_ledger_sysfs_exit();
+#endif
 	bus_unregister(&tee_bus_type);
 	unregister_chrdev_region(tee_devt, TEE_NUM_DEVICES);
 	class_unregister(&tee_class);
