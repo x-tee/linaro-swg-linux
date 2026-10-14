@@ -66,6 +66,25 @@ static void test_classify_busy_unknown(struct kunit *test)
 			teelog_classify_invoke(0, TEEC_ERROR_BUSY));
 }
 
+static void test_recover_owner_gate(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_PROCEED,
+			teelog_recover_owner_gate(false, false, 0, 1));
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_SKIP_LIVE,
+			teelog_recover_owner_gate(true, true, 1, 1));
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_SKIP_LIVE,
+			teelog_recover_owner_gate(true, true, 1, 2));
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_SKIP_OWNER,
+			teelog_recover_owner_gate(true, false, 1, 2));
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_SKIP_OWNER,
+			teelog_recover_owner_gate(true, false, 1, 0));
+	/* Unknown slot owner fails closed. */
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_SKIP_OWNER,
+			teelog_recover_owner_gate(true, false, 0, 1));
+	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_GATE_PROCEED,
+			teelog_recover_owner_gate(true, false, 1, 1));
+}
+
 static void test_recover_inactive_releases(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, TEELOG_RECOVER_RELEASE,
@@ -243,10 +262,10 @@ static void test_reader_catchup_unsaturated_lap(struct kunit *test)
 		.seq = 20,
 	};
 
-	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
 	KUNIT_EXPECT_EQ(test, 200U, pos.r_off);
 	KUNIT_EXPECT_EQ(test, 2U, pos.r_loops);
-	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
 }
 
 static void test_reader_catchup_saturated_wrap(struct kunit *test)
@@ -266,10 +285,10 @@ static void test_reader_catchup_saturated_wrap(struct kunit *test)
 	};
 
 	/* CR-004: equal saturated loops + last_pos < r_off ⇒ lapped. */
-	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
 	KUNIT_EXPECT_EQ(test, 100U, pos.r_off);
 	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
-	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
 }
 
 static void test_reader_catchup_saturated_same_off(struct kunit *test)
@@ -293,11 +312,12 @@ static void test_reader_catchup_saturated_same_off(struct kunit *test)
 	 * last_pos == r_off must not look like "no data".
 	 */
 	KUNIT_EXPECT_TRUE(test, teelog_reader_has_data(&pos, &snap));
-	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
 	KUNIT_EXPECT_EQ(test, 256U, pos.r_off);
 	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
-	KUNIT_EXPECT_EQ(test, 80ULL, pos.r_seq);
-	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_EQ(test, 40ULL, pos.r_seq);
+	KUNIT_EXPECT_EQ(test, 80ULL, pos.r_obs_seq);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
 	KUNIT_EXPECT_TRUE(test, teelog_reader_has_data(&pos, &snap));
 }
 
@@ -316,9 +336,196 @@ static void test_reader_catchup_seq_threshold(struct kunit *test)
 		.seq = 1ULL << 32,
 	};
 
-	KUNIT_EXPECT_TRUE(test, teelog_reader_catchup(&pos, &snap));
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
 	KUNIT_EXPECT_EQ(test, 0U, pos.r_off);
 	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+}
+
+static void test_reader_serial_seq_floor(struct kunit *test)
+{
+	struct teelog_hdr_snap snap = {
+		.last_pos = 128, .write_loops = U32_MAX,
+		.max_len = TEELOG_DEFAULT_MAX_LEN, .seq = 5000,
+	};
+	struct teelog_reader_pos pos = {
+		.r_off = 128, .r_loops = U32_MAX, .r_serial = 1000,
+		.r_serial_valid = true, .r_obs_valid = true,
+		.r_obs_seq = 5000, .r_obs_last = 128,
+	};
+
+	pos.r_seq = teelog_reader_serial_seq_floor(&snap);
+	/* seq floor is older than producer tip, but fully observed empty is empty. */
+	KUNIT_EXPECT_FALSE(test, teelog_reader_has_data(&pos, &snap));
+	snap.seq += 2;
+	KUNIT_EXPECT_TRUE(test, teelog_reader_has_data(&pos, &snap));
+	/* Delivered record age can cross half-range before tip-relative delta does. */
+	snap.seq = pos.r_seq + (1ULL << 32);
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
+	KUNIT_EXPECT_FALSE(test, pos.r_serial_valid);
+}
+
+/*
+ * Saturated wrap that lands last_pos > r_off: observed last_pos regression
+ * (261248 → 1152) proves the wrap — not a commit-count threshold.
+ */
+static void test_reader_catchup_saturated_obs_regression(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 128,
+		.r_loops = U32_MAX,
+		.r_seq = 1000,
+		.r_obs_seq = 1000,
+		.r_obs_last = 261248,
+		.r_obs_valid = true,
+		.r_serial_valid = true,
+		.r_serial = 10,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 1152,
+		.write_loops = U32_MAX,
+		.max_len = TEELOG_DEFAULT_MAX_LEN,
+		.seq = 1004,
+	};
+
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
+	KUNIT_EXPECT_EQ(test, 1152U, pos.r_off);
+	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+}
+
+static void reader_test_record(struct teelog_buffer *ring, u32 off, u32 len)
+{
+	struct teelog_item *item = (void *)(ring->buffer_start + off);
+
+	item->magic = TEELOG_ITEM_MAGIC;
+	item->buffer_len = len - TEELOG_ITEM_HDR_SIZE;
+	item->real_len = item->buffer_len;
+}
+
+/* No wrap: many short commits must not clear the serial baseline. */
+static void test_reader_catchup_saturated_no_wrap_short(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 128, .r_loops = U32_MAX, .r_seq = 2000,
+		.r_obs_seq = 2000, .r_obs_last = 128, .r_obs_valid = true,
+		.r_serial_valid = true, .r_serial = 1000,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 32896, .write_loops = U32_MAX,
+		.max_len = TEELOG_DEFAULT_MAX_LEN, .seq = 2000 + 512,
+	};
+	struct teelog_buffer *ring;
+	u32 i;
+
+	ring = kunit_kzalloc(test, TEELOG_DEFAULT_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, ring);
+	teelog_seq_store(&ring->flag, snap.seq);
+	reader_test_record(ring, 0, 128);
+	for (i = 0; i < 256; i++)
+		reader_test_record(ring, 128 + i * 128, 128);
+	KUNIT_EXPECT_EQ(test, 0, teelog_reader_catchup(&pos, &snap, ring,
+						     TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_EQ(test, 128U, pos.r_off);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_EQ(test, 1000U, pos.r_serial);
+	KUNIT_EXPECT_EQ(test, 32896U, pos.r_obs_last);
+	KUNIT_EXPECT_EQ(test, snap.seq, pos.r_obs_seq);
+}
+
+/* Original F4: one full lap can finish at a numerically larger producer tip. */
+static void test_reader_catchup_saturated_full_lap(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 128, .r_loops = U32_MAX, .r_seq = 1000,
+		.r_obs_seq = 1000, .r_obs_last = 128, .r_obs_valid = true,
+		.r_serial_valid = true, .r_serial = 10,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 1152, .write_loops = U32_MAX,
+		.max_len = TEELOG_DEFAULT_MAX_LEN, .seq = 1514,
+	};
+
+	KUNIT_EXPECT_EQ(test, 1, teelog_reader_catchup(&pos, &snap, NULL, 0));
+	KUNIT_EXPECT_EQ(test, 1152U, pos.r_off);
+	KUNIT_EXPECT_EQ(test, U32_MAX - 1U, pos.r_loops);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+}
+
+/* The length lower bound is inconclusive; the exact commit chain decides. */
+static void test_reader_catchup_saturated_span(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_off = 128, .r_loops = U32_MAX, .r_seq = 3000,
+		.r_obs_seq = 3000, .r_obs_last = 128, .r_obs_valid = true,
+		.r_serial_valid = true, .r_serial = 1000,
+	};
+	struct teelog_reader_pos before = pos;
+	struct teelog_hdr_snap snap = {
+		.last_pos = 204928, .write_loops = U32_MAX,
+		.max_len = TEELOG_DEFAULT_MAX_LEN, .seq = 3800,
+	};
+	struct teelog_buffer *ring;
+	u32 i;
+
+	ring = kunit_kzalloc(test, TEELOG_DEFAULT_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, ring);
+	reader_test_record(ring, 0, 128);
+	for (i = 0; i < 400; i++)
+		reader_test_record(ring, 128 + i * 512, 512);
+	teelog_seq_store(&ring->flag, snap.seq + 2);
+	KUNIT_EXPECT_EQ(test, -EAGAIN,
+		teelog_reader_catchup(&pos, &snap, ring, TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_EQ(test, 0, memcmp(&pos, &before, sizeof(pos)));
+	teelog_seq_store(&ring->flag, snap.seq);
+	KUNIT_EXPECT_EQ(test, 0,
+		teelog_reader_catchup(&pos, &snap, ring, TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+
+	/* Same span but only 200 complete records for 500 new commits: lapped. */
+	memset(ring->buffer_start, 0, TEELOG_DEFAULT_MAX_LEN);
+	reader_test_record(ring, 0, 128);
+	snap.seq = 4000;
+	teelog_seq_store(&ring->flag, snap.seq);
+	for (i = 0; i < 200; i++)
+		reader_test_record(ring, 128 + i * 1024, 1024);
+	pos = before;
+	KUNIT_EXPECT_EQ(test, 1,
+		teelog_reader_catchup(&pos, &snap, ring, TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+}
+
+static void test_reader_seek_current(struct kunit *test)
+{
+	struct teelog_reader_pos pos = {
+		.r_obs_seq = 2, .r_obs_last = 261888,
+		.r_serial_valid = true, .r_serial = 900,
+	};
+	struct teelog_hdr_snap snap = {
+		.last_pos = 128, .write_loops = U32_MAX, .seq = 2002,
+		.max_len = TEELOG_DEFAULT_MAX_LEN,
+	};
+	struct teelog_reader_pos before = pos;
+	struct teelog_buffer *ring;
+
+	ring = kunit_kzalloc(test, TEELOG_DEFAULT_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, ring);
+	reader_test_record(ring, 0, 128);
+	((struct teelog_item *)ring->buffer_start)->serial_no = 1001;
+	teelog_seq_store(&ring->flag, snap.seq + 2);
+	KUNIT_EXPECT_EQ(test, -EAGAIN,
+		teelog_reader_seek_current(&pos, &snap, ring, TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_EQ(test, 0, memcmp(&pos, &before, sizeof(pos)));
+	teelog_seq_store(&ring->flag, snap.seq);
+	KUNIT_EXPECT_EQ(test, 0,
+		teelog_reader_seek_current(&pos, &snap, ring, TEELOG_DEFAULT_SIZE));
+	KUNIT_EXPECT_EQ(test, snap.last_pos, pos.r_off);
+	KUNIT_EXPECT_EQ(test, snap.write_loops, pos.r_loops);
+	KUNIT_EXPECT_EQ(test, snap.seq, pos.r_seq);
+	KUNIT_EXPECT_EQ(test, snap.seq, pos.r_obs_seq);
+	KUNIT_EXPECT_EQ(test, snap.last_pos, pos.r_obs_last);
+	KUNIT_EXPECT_TRUE(test, pos.r_obs_valid);
+	KUNIT_EXPECT_TRUE(test, pos.r_serial_valid);
+	KUNIT_EXPECT_EQ(test, 1001U, pos.r_serial);
 }
 
 static void test_serial_accept_baseline(struct kunit *test)
@@ -390,6 +597,7 @@ static struct kunit_case teelog_lifecycle_cases[] = {
 	KUNIT_CASE(test_classify_communication_unknown),
 	KUNIT_CASE(test_classify_explicit_reject),
 	KUNIT_CASE(test_classify_busy_unknown),
+	KUNIT_CASE(test_recover_owner_gate),
 	KUNIT_CASE(test_recover_inactive_releases),
 	KUNIT_CASE(test_recover_active_match_unregisters),
 	KUNIT_CASE(test_recover_active_mismatch_aborts),
@@ -405,6 +613,12 @@ static struct kunit_case teelog_lifecycle_cases[] = {
 	KUNIT_CASE(test_reader_catchup_saturated_wrap),
 	KUNIT_CASE(test_reader_catchup_saturated_same_off),
 	KUNIT_CASE(test_reader_catchup_seq_threshold),
+	KUNIT_CASE(test_reader_serial_seq_floor),
+	KUNIT_CASE(test_reader_catchup_saturated_obs_regression),
+	KUNIT_CASE(test_reader_catchup_saturated_no_wrap_short),
+	KUNIT_CASE(test_reader_catchup_saturated_full_lap),
+	KUNIT_CASE(test_reader_catchup_saturated_span),
+	KUNIT_CASE(test_reader_seek_current),
 	KUNIT_CASE(test_serial_accept_baseline),
 	KUNIT_CASE(test_next_record_reports_found_off),
 	{}

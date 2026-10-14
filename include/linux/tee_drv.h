@@ -329,16 +329,20 @@ struct tee_client_driver {
  * @size: Requested log size
  * @order: Original page allocation order
  * @generation: Resident allocation id, needed for matching recovery operations
+ * @owner_key: Stable TEE backend identity that recorded the slot (not a pointer)
  * @occupied: False means the snapshot is empty and all fields are zero
  * @isolated: Stop-write was not confirmed
+ * @live: True while a published ACTIVE instance still maps the pages
  */
 struct teelog_ledger_entry {
 	u64 pa;
 	u32 size;
 	u32 order;
 	u32 generation;
+	u64 owner_key;
 	bool occupied;
 	bool isolated;
+	bool live;
 };
 
 /**
@@ -372,16 +376,41 @@ void teelog_ledger_end(void);
  * @pa:		Physical address of the pages (linear-map backed)
  * @size:	Byte size of the allocation
  * @order:	get_order(size) used for free_pages
+ * @owner_key:	Non-zero stable backend identity (never a struct optee *)
  * @generation:	Output: newly allocated monotonic generation
  *
  * Caller must hold teelog_ledger_begin(). Under the ledger mutex: allocate the
- * next generation and occupy the single slot. Non-empty slot → -EBUSY;
- * generation space exhausted → -ENOSPC. On success the ledger owns the pages;
- * on failure the caller still owns them and must free.
+ * next generation and occupy the single slot with live=false. Non-empty slot →
+ * -EBUSY; generation space exhausted → -ENOSPC; owner_key 0 → -EINVAL.
+ * On success the ledger owns the pages; on failure the caller still owns them
+ * and must free.
  *
  * Return: 0 on success, negative errno on failure.
  */
-int teelog_ledger_record(u64 pa, u32 size, u32 order, u32 *generation);
+int teelog_ledger_record(u64 pa, u32 size, u32 order, u64 owner_key,
+			 u32 *generation);
+
+/**
+ * teelog_ledger_claim_live() - Mark slot live after publishing an ACTIVE mapper
+ * @generation:	Allocation id that must match
+ * @owner_key:	Must match the recorded backend identity
+ *
+ * Caller must hold teelog_ledger_begin(). Recovery must not run while live.
+ *
+ * Return: 0, -ENOENT, -EBUSY if already live, -EPERM without begin.
+ */
+int teelog_ledger_claim_live(u32 generation, u64 owner_key);
+
+/**
+ * teelog_ledger_drop_live() - Clear live so same-owner recovery may proceed
+ * @generation:	Allocation id that must match
+ * @owner_key:	Must match the recorded backend identity
+ *
+ * Caller must hold teelog_ledger_begin(). Does not free pages.
+ *
+ * Return: 0, -ENOENT, -EPERM without begin.
+ */
+int teelog_ledger_drop_live(u32 generation, u64 owner_key);
 
 /**
  * teelog_ledger_lookup() - Look up a recorded allocation by generation

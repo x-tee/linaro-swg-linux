@@ -1074,6 +1074,8 @@ static int optee_ffa_probe(struct ffa_device *ffa_dev)
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 	mutex_init(&optee->teelog_slot_mu);
 	RCU_INIT_POINTER(optee->teelog_notif, NULL);
+	/* Bind to this FF-A partition; vm_id distinguishes endpoints. */
+	optee->teelog_owner_key = OPTEE_TEELOG_OWNER_FFA(ffa_dev->vm_id);
 #endif
 
 	pool = optee_ffa_shm_pool_alloc_pages();

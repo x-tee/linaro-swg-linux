@@ -26,9 +26,14 @@ struct teelog_hdr_snap {
 struct teelog_reader_pos {
 	u32 r_off;
 	u32 r_loops;
+	/* Conservative producer-seq floor for the delivered serial baseline. */
 	u64 r_seq;
+	/* Producer tip and commit seq from the same observed stable snapshot. */
+	u64 r_obs_seq;
+	u32 r_obs_last;
 	u32 r_serial;
 	bool r_serial_valid;
+	bool r_obs_valid;
 };
 
 /**
@@ -57,16 +62,41 @@ static inline u32 teelog_item_total_len(const struct teelog_item *item)
 int teelog_snap_flag(const struct teelog_buffer *ring, u32 capacity,
 		     struct teelog_hdr_snap *out);
 
+/**
+ * teelog_reader_seek_current() - Atomically seek and seed the serial floor
+ *
+ * Caller pins ring; returns 0, -EAGAIN or -EIO. Errors leave pos unchanged.
+ */
+int teelog_reader_seek_current(struct teelog_reader_pos *pos,
+			       const struct teelog_hdr_snap *snap,
+			       const struct teelog_buffer *ring, u32 capacity);
+
 void teelog_reader_init_window(struct teelog_reader_pos *pos,
 			       const struct teelog_hdr_snap *snap);
 
 /**
- * teelog_reader_catchup() - Reposition if the reader was lapped (CR-004)
+ * teelog_reader_catchup() - Recheck the retained window after wrap/coverage
  *
- * Returns true if the cursor jumped (serial must be rebuilt).
+ * @ring: Live allocation, pinned by the caller for the entire call
+ * @capacity: Allocated bytes including the header
+ *
+ * Returns 1 if the cursor jumped, 0 otherwise,
+ * -EAGAIN if a saturated span check raced a commit, or -EIO for bad bounds.
+ * A negative result leaves pos unchanged. Ordinary jumps keep a valid serial
+ * baseline; a >=2^32 seq advance rebases it to avoid half-range ambiguity.
  */
-bool teelog_reader_catchup(struct teelog_reader_pos *pos,
-			   const struct teelog_hdr_snap *snap);
+int teelog_reader_catchup(struct teelog_reader_pos *pos,
+			  const struct teelog_hdr_snap *snap,
+			  const struct teelog_buffer *ring, u32 capacity);
+
+/* A delivered retained record may precede the sampled producer tip by a ring.
+ * Include that bounded age when testing the signed serial half-range later.
+ */
+static inline u64 teelog_reader_serial_seq_floor(const struct teelog_hdr_snap *snap)
+{
+	return snap->seq - 2ULL * (snap->max_len /
+			(TEELOG_ITEM_HDR_SIZE + TEELOG_ITEM_LEN_ALIGN));
+}
 
 bool teelog_reader_has_data(const struct teelog_reader_pos *pos,
 			    const struct teelog_hdr_snap *snap);

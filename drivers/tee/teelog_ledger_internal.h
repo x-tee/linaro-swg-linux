@@ -16,6 +16,14 @@
 struct teelog_ledger_slot {
 	bool occupied;
 	bool isolated;
+	/*
+	 * live: a published ACTIVE instance still maps these pages.
+	 * Recovery/query/free is forbidden while live. Cleared on stop,
+	 * orphan hand-off, or release_once — never inferred from TEE state.
+	 */
+	bool live;
+	/* Stable backend identity (SMC/FF-A/…); not a struct optee *. */
+	u64 owner_key;
 	u64 pa;
 	u32 size;
 	u32 order;
@@ -66,12 +74,12 @@ static inline void teelog_ledger_do_end(struct teelog_ledger_state *ledger)
 
 static inline int teelog_ledger_do_record(struct teelog_ledger_state *ledger,
 					  u64 pa, u32 size, u32 order,
-					  u32 *generation)
+					  u64 owner_key, u32 *generation)
 {
 	u32 gen;
 	int rc = 0;
 
-	if (!generation || !size || !IS_ALIGNED(pa, PAGE_SIZE) ||
+	if (!generation || !owner_key || !size || !IS_ALIGNED(pa, PAGE_SIZE) ||
 	    !IS_ALIGNED(size, PAGE_SIZE) || order != get_order(size))
 		return -EINVAL;
 	if (!teelog_ledger_life_held(ledger))
@@ -96,6 +104,8 @@ static inline int teelog_ledger_do_record(struct teelog_ledger_state *ledger,
 
 	ledger->slot.occupied = true;
 	ledger->slot.isolated = false;
+	ledger->slot.live = false;
+	ledger->slot.owner_key = owner_key;
 	ledger->slot.pa = pa;
 	ledger->slot.size = size;
 	ledger->slot.order = order;
@@ -106,6 +116,57 @@ static inline int teelog_ledger_do_record(struct teelog_ledger_state *ledger,
 		ledger->pages_recorded = U64_MAX;
 
 out:
+	mutex_unlock(&ledger->ledger_mu);
+	return rc;
+}
+
+/*
+ * Mark the matching slot live after /dev/teelog publish. Rejects a second
+ * live claim even with the same generation — only one ACTIVE mapper.
+ */
+static inline int teelog_ledger_do_claim_live(struct teelog_ledger_state *ledger,
+					     u32 generation, u64 owner_key)
+{
+	int rc = -ENOENT;
+
+	if (!generation || !owner_key)
+		return -EINVAL;
+	if (!teelog_ledger_life_held(ledger))
+		return -EPERM;
+
+	mutex_lock(&ledger->ledger_mu);
+	if (ledger->slot.occupied &&
+	    ledger->slot.generation == generation &&
+	    ledger->slot.owner_key == owner_key) {
+		if (ledger->slot.live)
+			rc = -EBUSY;
+		else {
+			ledger->slot.live = true;
+			rc = 0;
+		}
+	}
+	mutex_unlock(&ledger->ledger_mu);
+	return rc;
+}
+
+/* Clear live so a later same-owner probe may recover; keeps the credential. */
+static inline int teelog_ledger_do_drop_live(struct teelog_ledger_state *ledger,
+					    u32 generation, u64 owner_key)
+{
+	int rc = -ENOENT;
+
+	if (!generation || !owner_key)
+		return -EINVAL;
+	if (!teelog_ledger_life_held(ledger))
+		return -EPERM;
+
+	mutex_lock(&ledger->ledger_mu);
+	if (ledger->slot.occupied &&
+	    ledger->slot.generation == generation &&
+	    ledger->slot.owner_key == owner_key) {
+		ledger->slot.live = false;
+		rc = 0;
+	}
 	mutex_unlock(&ledger->ledger_mu);
 	return rc;
 }
@@ -205,6 +266,8 @@ static inline int teelog_ledger_do_snapshot(struct teelog_ledger_state *ledger,
 	if (ledger->slot.occupied) {
 		entry->occupied = true;
 		entry->isolated = ledger->slot.isolated;
+		entry->live = ledger->slot.live;
+		entry->owner_key = ledger->slot.owner_key;
 		entry->pa = ledger->slot.pa;
 		entry->size = ledger->slot.size;
 		entry->order = ledger->slot.order;

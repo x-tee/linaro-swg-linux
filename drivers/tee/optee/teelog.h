@@ -14,6 +14,21 @@ struct optee_teelog;
 
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 
+/*
+ * Stable ledger owner keys — not pointers; survive optee.ko unload.
+ * High 32 bits = transport kind; low 32 bits = endpoint id (0 for SMC
+ * singleton, FF-A vm_id for each partition). Shared FFA constants alone
+ * must not authorize cross-endpoint recovery.
+ */
+#define OPTEE_TEELOG_OWNER_KIND_SMC	0x534d4301U /* "SMC\1" */
+#define OPTEE_TEELOG_OWNER_KIND_FFA	0x46464101U /* "FFA\1" */
+#define OPTEE_TEELOG_OWNER_PACK(kind, id) \
+	(((u64)(u32)(kind) << 32) | (u32)(id))
+#define OPTEE_TEELOG_OWNER_SMC \
+	OPTEE_TEELOG_OWNER_PACK(OPTEE_TEELOG_OWNER_KIND_SMC, 0)
+#define OPTEE_TEELOG_OWNER_FFA(vm_id) \
+	OPTEE_TEELOG_OWNER_PACK(OPTEE_TEELOG_OWNER_KIND_FFA, (vm_id))
+
 void optee_teelog_init(struct optee *optee);
 void optee_teelog_stop(struct optee *optee);
 

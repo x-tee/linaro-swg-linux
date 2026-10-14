@@ -33,9 +33,24 @@ static inline void test_ledger_end(void)
 	teelog_ledger_do_end(&test_ledger);
 }
 
+#define TEST_OWNER_KEY	0x544553542d4f4b31ULL /* "TEST-OK1" */
+
 static inline int test_ledger_record(u64 pa, u32 size, u32 order, u32 *generation)
 {
-	return teelog_ledger_do_record(&test_ledger, pa, size, order, generation);
+	return teelog_ledger_do_record(&test_ledger, pa, size, order,
+				       TEST_OWNER_KEY, generation);
+}
+
+static inline int test_ledger_claim_live(u32 generation)
+{
+	return teelog_ledger_do_claim_live(&test_ledger, generation,
+					   TEST_OWNER_KEY);
+}
+
+static inline int test_ledger_drop_live(u32 generation)
+{
+	return teelog_ledger_do_drop_live(&test_ledger, generation,
+					  TEST_OWNER_KEY);
 }
 
 static inline int test_ledger_lookup(u32 generation, u64 *pa, u32 *size,
@@ -724,6 +739,8 @@ static void test_snapshot_without_generation(struct kunit *test)
 	}
 	KUNIT_EXPECT_TRUE(test, entry.occupied);
 	KUNIT_EXPECT_TRUE(test, entry.isolated);
+	KUNIT_EXPECT_FALSE(test, entry.live);
+	KUNIT_EXPECT_EQ(test, TEST_OWNER_KEY, entry.owner_key);
 	KUNIT_EXPECT_EQ(test, pa, entry.pa);
 	KUNIT_EXPECT_EQ(test, (u32)PAGE_SIZE, entry.size);
 	KUNIT_EXPECT_EQ(test, order, entry.order);
@@ -738,11 +755,50 @@ static void test_snapshot_without_generation(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0, test_ledger_snapshot(&entry));
 	KUNIT_EXPECT_FALSE(test, entry.occupied);
 	KUNIT_EXPECT_FALSE(test, entry.isolated);
+	KUNIT_EXPECT_FALSE(test, entry.live);
 	KUNIT_EXPECT_EQ(test, 0ULL, entry.pa);
+	KUNIT_EXPECT_EQ(test, 0ULL, entry.owner_key);
 	KUNIT_EXPECT_EQ(test, 0U, entry.generation);
 	KUNIT_EXPECT_EQ(test, 0U, entry.size);
 	KUNIT_EXPECT_EQ(test, 0U, entry.order);
 	KUNIT_EXPECT_EQ(test, -ENOENT, test_ledger_release_once(gen));
+out:
+	teelog_ctx_unwind(&c);
+}
+
+/* live claim blocks recovery; drop_live restores same-owner recoverability. */
+static void test_live_claim_and_drop(struct kunit *test)
+{
+	struct teelog_ctx c = {};
+	struct teelog_ledger_entry entry;
+	unsigned long va;
+	u64 pa;
+	u32 order, gen = 0;
+
+	va = test_alloc_pages(&order, &pa);
+	if (!va) {
+		KUNIT_FAIL(test, "page alloc failed");
+		return;
+	}
+	teelog_ctx_note_pending(&c, va, order);
+	if (teelog_ctx_begin(&c)) {
+		KUNIT_FAIL(test, "begin failed");
+		goto out;
+	}
+	if (test_ledger_record(pa, PAGE_SIZE, order, &gen)) {
+		KUNIT_FAIL(test, "record failed");
+		goto out;
+	}
+	teelog_ctx_note_owned(&c, gen);
+	KUNIT_EXPECT_EQ(test, 0, test_ledger_claim_live(gen));
+	KUNIT_EXPECT_EQ(test, -EBUSY, test_ledger_claim_live(gen));
+	KUNIT_EXPECT_EQ(test, 0, test_ledger_snapshot(&entry));
+	KUNIT_EXPECT_TRUE(test, entry.live);
+	KUNIT_EXPECT_EQ(test, 0, test_ledger_drop_live(gen));
+	KUNIT_EXPECT_EQ(test, 0, test_ledger_snapshot(&entry));
+	KUNIT_EXPECT_FALSE(test, entry.live);
+	KUNIT_EXPECT_EQ(test, 0, test_ledger_release_once(gen));
+	teelog_ctx_note_released(&c);
 out:
 	teelog_ctx_unwind(&c);
 }
@@ -778,7 +834,7 @@ static void test_exhaustion_leaves_resident_usable(struct kunit *test)
 		KUNIT_FAIL(test, "page alloc failed");
 		return;
 	}
-	rc = teelog_ledger_record(pa, PAGE_SIZE, order, &gen);
+	rc = teelog_ledger_record(pa, PAGE_SIZE, order, TEST_OWNER_KEY, &gen);
 	KUNIT_EXPECT_EQ(test, 0, rc);
 	if (rc)
 		free_pages(va, order);
@@ -798,6 +854,7 @@ static struct kunit_case teelog_ledger_test_cases[] = {
 	KUNIT_CASE(test_unwind_while_life_held),
 	KUNIT_CASE(test_concurrent_release_once),
 	KUNIT_CASE(test_snapshot_without_generation),
+	KUNIT_CASE(test_live_claim_and_drop),
 	KUNIT_CASE(test_generation_monotonic_and_exhaustion),
 	KUNIT_CASE(test_exhaustion_leaves_resident_usable),
 	{}

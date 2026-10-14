@@ -1831,6 +1831,7 @@ static int optee_probe(struct platform_device *pdev)
 #if IS_ENABLED(CONFIG_OPTEE_TEELOG)
 	mutex_init(&optee->teelog_slot_mu);
 	RCU_INIT_POINTER(optee->teelog_notif, NULL);
+	optee->teelog_owner_key = OPTEE_TEELOG_OWNER_SMC;
 #endif
 
 	optee->ops = &optee_ops;

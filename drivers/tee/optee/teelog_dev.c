@@ -226,7 +226,13 @@ retry_snap:
 	if (rc)
 		return rc;
 
-	teelog_reader_catchup(tmp, snap);
+	rc = teelog_reader_catchup(tmp, snap, ring, tl->size);
+	if (rc == -EAGAIN) {
+		(*seq_tries)++;
+		goto retry_snap;
+	}
+	if (rc < 0)
+		return rc;
 	if (!teelog_reader_has_data(tmp, snap))
 		return -ENODATA;
 
@@ -258,14 +264,19 @@ retry_snap:
 			goto retry_snap;
 		}
 		if (rc == -ENOENT) {
-			/* Whole [off, end) scanned; advance past this segment. */
-			tmp->r_off = end;
+			/*
+			 * Whole [off, end) scanned with no valid record.
+			 * Wrap-tail padding: advance into the next segment.
+			 * Same-loop non-empty window that is stably empty of
+			 * valid records is corruption — EIO, do not commit
+			 * the scan cursor as a normal read-empty (F5).
+			 */
 			if (tmp->r_loops != snap->write_loops) {
 				tmp->r_off = 0;
 				tmp->r_loops = snap->write_loops;
 				continue;
 			}
-			return -ENODATA;
+			return -EIO;
 		}
 		if (rc)
 			return rc;
@@ -329,7 +340,7 @@ static ssize_t teelog_read_records(struct teelog_reader *reader,
 
 		written += stage_len;
 		tmp.r_off = found_off + stage_len;
-		tmp.r_seq = snap.seq;
+		tmp.r_seq = teelog_reader_serial_seq_floor(&snap);
 		teelog_serial_commit(&tmp, item->serial_no);
 		if (tmp.r_off >= snap.max_len &&
 		    tmp.r_loops != snap.write_loops) {
@@ -374,24 +385,25 @@ static __poll_t teelog_poll(struct file *file, poll_table *wait)
 	tl = reader->tl;
 	poll_wait(file, &tl->wq, wait);
 
+	/* Same reader -> state lock order as read/ioctl; pin pages for the scan. */
+	mutex_lock(&reader->mu);
 	mutex_lock(&tl->state_lock);
 	if (tl->state != OPTEE_TEELOG_ACTIVE || !tl->va) {
-		mutex_unlock(&tl->state_lock);
-		return EPOLLHUP | EPOLLERR;
+		mask = EPOLLHUP | EPOLLERR;
+		goto out;
 	}
 	rc = teelog_snap_flag((struct teelog_buffer *)tl->va, tl->size, &snap);
-	mutex_unlock(&tl->state_lock);
-
+	if (!rc) {
+		tmp = reader->pos;
+		rc = teelog_reader_catchup(&tmp, &snap,
+					 (struct teelog_buffer *)tl->va, tl->size);
+		if (rc >= 0 && teelog_reader_has_data(&tmp, &snap))
+			mask = EPOLLIN | EPOLLRDNORM;
+	}
 	if (rc == -ENODEV || rc == -EIO)
-		return EPOLLHUP | EPOLLERR;
-	if (rc)
-		return 0;
-
-	mutex_lock(&reader->mu);
-	tmp = reader->pos;
-	teelog_reader_catchup(&tmp, &snap);
-	if (teelog_reader_has_data(&tmp, &snap))
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask = EPOLLHUP | EPOLLERR;
+out:
+	mutex_unlock(&tl->state_lock);
 	mutex_unlock(&reader->mu);
 	return mask;
 }
@@ -421,6 +433,7 @@ static long teelog_unlocked_ioctl(struct file *file, unsigned int cmd,
 {
 	struct teelog_reader *reader = file->private_data;
 	struct optee_teelog *tl;
+	struct teelog_buffer *ring;
 	void __user *argp = (void __user *)arg;
 	struct teelog_hdr_snap snap;
 	struct teelog_caps caps = {};
@@ -437,13 +450,13 @@ static long teelog_unlocked_ioctl(struct file *file, unsigned int cmd,
 
 	case TEELOGGER_SET_READERPOS_CUR:
 		mutex_lock(&reader->mu);
-		rc = teelog_snap_active(tl, &snap);
-		if (!rc) {
-			reader->pos.r_off = snap.last_pos;
-			reader->pos.r_loops = snap.write_loops;
-			reader->pos.r_seq = snap.seq;
-			reader->pos.r_serial_valid = false;
-		}
+		mutex_lock(&tl->state_lock);
+		ring = teelog_ring_or_null(tl);
+		rc = ring ? teelog_snap_flag(ring, tl->size, &snap) : -ENODEV;
+		if (!rc)
+			rc = teelog_reader_seek_current(&reader->pos, &snap, ring,
+						       tl->size);
+		mutex_unlock(&tl->state_lock);
 		mutex_unlock(&reader->mu);
 		return rc;
 

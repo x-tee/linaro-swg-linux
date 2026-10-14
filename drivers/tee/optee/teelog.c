@@ -337,6 +337,9 @@ teelog_cmd_unregister(struct tee_context *ctx, u32 session, u32 generation)
 /*
  * Caller holds teelog_ledger_begin(). Opens a temporary session on @optee,
  * recovers any prior ledger slot, then returns with the lock still held.
+ *
+ * Refuses to query/free while another (or this) backend still has a live
+ * mapper, and refuses cross-backend release of a recoverable slot.
  */
 static int teelog_recover_locked(struct optee *optee)
 {
@@ -349,7 +352,9 @@ static int teelog_recover_locked(struct optee *optee)
 	bool matched;
 	enum teelog_comm_result cls;
 	enum teelog_recover_action action;
+	enum teelog_recover_gate gate;
 	enum teelog_page_fate fate;
+	u64 my_owner;
 	int rc;
 
 	rc = teelog_ledger_snapshot(&entry);
@@ -358,8 +363,25 @@ static int teelog_recover_locked(struct optee *optee)
 	if (!entry.occupied)
 		return 0;
 
-	pr_info("recover: ledger gen=%u pa=0x%llx size=%u isolated=%d\n",
-		entry.generation, entry.pa, entry.size, entry.isolated);
+	my_owner = optee->teelog_owner_key;
+	gate = teelog_recover_owner_gate(entry.occupied, entry.live,
+					 entry.owner_key, my_owner);
+	if (gate == TEELOG_RECOVER_GATE_SKIP_LIVE) {
+		pr_info("recover: skip live gen=%u owner=0x%llx (teelog disabled for this probe)\n",
+			entry.generation,
+			(unsigned long long)entry.owner_key);
+		return -EBUSY;
+	}
+	if (gate == TEELOG_RECOVER_GATE_SKIP_OWNER) {
+		pr_warn("recover: skip foreign owner=0x%llx gen=%u (want 0x%llx)\n",
+			(unsigned long long)entry.owner_key, entry.generation,
+			(unsigned long long)my_owner);
+		return -EPERM;
+	}
+
+	pr_info("recover: ledger gen=%u pa=0x%llx size=%u isolated=%d live=%d\n",
+		entry.generation, entry.pa, entry.size, entry.isolated,
+		entry.live);
 
 	rc = teelog_open_session(optee, &ctx, &session);
 	if (rc) {
@@ -508,7 +530,8 @@ static int teelog_register_new_locked(struct optee *optee)
 	if (rc)
 		goto err_close;
 
-	rc = teelog_ledger_record(pa, size, order, &generation);
+	rc = teelog_ledger_record(pa, size, order, optee->teelog_owner_key,
+				  &generation);
 	if (rc)
 		goto err_free_pages;
 
@@ -546,6 +569,15 @@ static int teelog_register_new_locked(struct optee *optee)
 	mutex_unlock(&tl->state_lock);
 
 	teelog_slot_publish(optee, tl);
+	rc = teelog_ledger_claim_live(generation, optee->teelog_owner_key);
+	if (rc) {
+		pr_err("TEELOG_CLAIM_LIVE_FAIL gen=%u (%d); stopping\n",
+		       generation, rc);
+		tl = teelog_slot_take(optee);
+		if (tl)
+			teelog_stop_instance_locked(optee, tl);
+		return rc;
+	}
 	pr_info("TEELOG_REGISTER_OK pa=0x%llx size=%u gen=%u notif=0x%x\n",
 		pa, size, generation, notif_id);
 
@@ -595,6 +627,12 @@ static int teelog_stop_instance_locked(struct optee *optee,
 	generation = tl->generation;
 	/* Keep ctx pointers until after UNREGISTER; cleared in detach. */
 	mutex_unlock(&tl->state_lock);
+
+	/*
+	 * Drop live before UNREGISTER/release so a concurrent probe (after
+	 * life_mu) sees a recoverable credential, not an ACTIVE mapper.
+	 */
+	(void)teelog_ledger_drop_live(generation, optee->teelog_owner_key);
 
 	/* Forbid new opens / wake pollers before pages go away (§5–§6). */
 	teelog_dev_shutdown(tl);
@@ -730,7 +768,12 @@ static int teelog_fault_orphan_locked(struct optee *optee)
 	tl->optee = NULL;
 	mutex_unlock(&tl->state_lock);
 
-	/* Keep ledger occupied; TEE registration stays with the orphaned session. */
+	/*
+	 * Keep ledger occupied; TEE registration stays with the orphaned
+	 * session. Clear live so a later same-owner probe may recover —
+	 * there is no ACTIVE Linux mapper anymore.
+	 */
+	(void)teelog_ledger_drop_live(generation, optee->teelog_owner_key);
 	teelog_ledger_mark_isolated(generation);
 	optee_teelog_put(tl);
 	pr_info("TEELOG_FAULT_ACT_ORPHAN gen=%u\n", generation);
@@ -828,6 +871,12 @@ void optee_teelog_init(struct optee *optee)
 	}
 
 	rc = teelog_recover_locked(optee);
+	if (rc == -EBUSY || rc == -EPERM) {
+		teelog_ledger_end();
+		pr_info("init: teelog skipped for this device (%d); OP-TEE continues\n",
+			rc);
+		return;
+	}
 	if (rc) {
 		teelog_ledger_end();
 		pr_warn("init: recovery incomplete; skip new REGISTER\n");

@@ -1441,11 +1441,27 @@ void teelog_ledger_end(void)
 }
 EXPORT_SYMBOL_GPL(teelog_ledger_end);
 
-int teelog_ledger_record(u64 pa, u32 size, u32 order, u32 *generation)
+int teelog_ledger_record(u64 pa, u32 size, u32 order, u64 owner_key,
+			 u32 *generation)
 {
-	return teelog_ledger_do_record(&teelog_ledger, pa, size, order, generation);
+	return teelog_ledger_do_record(&teelog_ledger, pa, size, order,
+				       owner_key, generation);
 }
 EXPORT_SYMBOL_GPL(teelog_ledger_record);
+
+int teelog_ledger_claim_live(u32 generation, u64 owner_key)
+{
+	return teelog_ledger_do_claim_live(&teelog_ledger, generation,
+					   owner_key);
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_claim_live);
+
+int teelog_ledger_drop_live(u32 generation, u64 owner_key)
+{
+	return teelog_ledger_do_drop_live(&teelog_ledger, generation,
+					  owner_key);
+}
+EXPORT_SYMBOL_GPL(teelog_ledger_drop_live);
 
 int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
 			 bool *isolated)
@@ -1496,8 +1512,9 @@ static ssize_t teelog_ledger_sysfs_show(struct kobject *kobj,
 	mutex_unlock(&teelog_ledger.ledger_mu);
 
 	return sysfs_emit(buf,
-			  "occupied=%u isolated=%u generation=%u size=%u order=%u next_gen=%u recorded_pages=%llu freed_pages=%llu\n",
-			  slot.occupied, slot.isolated, slot.generation,
+			  "occupied=%u isolated=%u live=%u owner=0x%llx generation=%u size=%u order=%u next_gen=%u recorded_pages=%llu freed_pages=%llu\n",
+			  slot.occupied, slot.isolated, slot.live,
+			  (unsigned long long)slot.owner_key, slot.generation,
 			  slot.size, slot.order, next_gen,
 			  pages_recorded, pages_freed);
 }

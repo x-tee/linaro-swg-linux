@@ -265,6 +265,11 @@ struct optee {
 	 * Cleared with synchronize_rcu before the instance may be freed.
 	 */
 	struct optee_teelog __rcu *teelog_notif;
+	/*
+	 * Stable ledger owner identity for this TEE backend (SMC/FF-A/…).
+	 * Must not be a struct optee * — those are freed across rmmod.
+	 */
+	u64 teelog_owner_key;
 #endif
 };
 

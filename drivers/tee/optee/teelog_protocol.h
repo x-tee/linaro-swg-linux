@@ -240,12 +240,17 @@ struct teelog_stats {
  *   void teelog_ledger_end(void);
  *       Releases the lifecycle lock taken by a successful begin().
  *
- *   int teelog_ledger_record(u64 pa, u32 size, u32 order, u32 *generation);
+ *   int teelog_ledger_record(u64 pa, u32 size, u32 order, u64 owner_key,
+ *			      u32 *generation);
  *       Under ledger mutex: allocate next monotonic generation, then register
- *       the slot. On success writes *generation. Non-empty slot → -EBUSY;
- *       generation exhausted → -ENOSPC. Caller must hold begin(). Generation
- *       lives in tee_core resident state (not optee.ko), so reload does not
- *       reset the counter.
+ *       the slot with live=false and the given non-zero owner_key. On success
+ *       writes *generation. Non-empty slot → -EBUSY; generation exhausted →
+ *       -ENOSPC. Caller must hold begin(). Generation lives in tee_core
+ *       resident state (not optee.ko), so reload does not reset the counter.
+ *
+ *   int teelog_ledger_claim_live(u32 generation, u64 owner_key);
+ *   int teelog_ledger_drop_live(u32 generation, u64 owner_key);
+ *       Toggle the live mapper flag; recovery must not free while live.
  *
  *   int teelog_ledger_mark_isolated(u32 generation);
  *       Under ledger mutex: set isolated on matching slot. Preserves
@@ -253,7 +258,8 @@ struct teelog_stats {
  *
  *   int teelog_ledger_snapshot(struct teelog_ledger_entry *entry);
  *       Discovers the resident slot without a generation; caller holds begin().
- *       Empty snapshot is all zero. Nonempty includes generation and ownership.
+ *       Empty snapshot is all zero. Nonempty includes generation, owner_key,
+ *       live, and isolation.
  *
  *   int teelog_ledger_lookup(u32 generation, u64 *pa, u32 *size, u32 *order,
  *			      bool *isolated);

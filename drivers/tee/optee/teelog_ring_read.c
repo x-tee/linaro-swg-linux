@@ -80,96 +80,200 @@ int teelog_snap_flag(const struct teelog_buffer *ring, u32 capacity,
 }
 EXPORT_SYMBOL_GPL(teelog_snap_flag);
 
+static void teelog_reader_init_current(struct teelog_reader_pos *pos,
+				      const struct teelog_hdr_snap *snap)
+{
+	if (!pos || !snap)
+		return;
+
+	*pos = (struct teelog_reader_pos) {
+		.r_off = snap->last_pos,
+		.r_loops = snap->write_loops,
+		.r_seq = snap->seq,
+		.r_obs_seq = snap->seq,
+		.r_obs_last = snap->last_pos,
+		.r_obs_valid = true,
+	};
+}
+
 void teelog_reader_init_window(struct teelog_reader_pos *pos,
 			       const struct teelog_hdr_snap *snap)
 {
 	if (!pos || !snap)
 		return;
 
-	if (snap->write_loops == 0) {
+	teelog_reader_init_current(pos, snap);
+	if (snap->write_loops)
+		pos->r_loops--;
+	else
 		pos->r_off = 0;
-		pos->r_loops = 0;
-	} else {
-		/* Oldest retained byte starts at last_pos after a wrap. */
-		pos->r_off = snap->last_pos;
-		pos->r_loops = snap->write_loops - 1U;
-	}
-	pos->r_seq = snap->seq;
-	pos->r_serial = 0;
-	pos->r_serial_valid = false;
 }
 EXPORT_SYMBOL_GPL(teelog_reader_init_window);
 
 static void teelog_reader_jump_retain(struct teelog_reader_pos *pos,
-				      const struct teelog_hdr_snap *snap)
+				      const struct teelog_hdr_snap *snap,
+				      bool rebase)
 {
+	u32 serial = pos->r_serial;
+	u64 seq = pos->r_seq;
+	bool valid = pos->r_serial_valid;
+
 	teelog_reader_init_window(pos, snap);
+	if (!rebase && valid) {
+		/* A wrap need not have destroyed records already read in the tail. */
+		pos->r_serial = serial;
+		pos->r_serial_valid = true;
+		pos->r_seq = seq;
+	}
 }
 
 /*
- * Approx seq units for one full ring of minimum-size records (hdr+64 body).
- * seq advances by 2 per commit; used only under write_loops saturation.
+ * Follow real record boundaries from zero through the current prefix. Starting
+ * at an old observed offset is unsafe after wrap: it may now be inside payload
+ * containing valid-looking headers. One ring of >=128-byte records bounds work.
  */
-static u64 teelog_seq_per_ring(u32 max_len)
+static int teelog_prefix_snapshot(const struct teelog_buffer *ring, u32 capacity,
+				  const struct teelog_hdr_snap *snap, u32 observed,
+				  u32 *suffix, u32 *last_serial, bool *boundary)
 {
-	u32 min_rec = TEELOG_ITEM_HDR_SIZE + TEELOG_ITEM_LEN_ALIGN;
-	u32 max_recs;
+	struct teelog_item item;
+	u32 off = 0, count = 0, serial = 0;
+	bool found = false;
+	int rc = 0;
 
-	if (!max_len || max_len < min_rec)
-		return 2;
-	max_recs = max_len / min_rec;
-	return (u64)max_recs * 2ULL;
+	if (!ring || capacity < TEELOG_MIN_SIZE || capacity > TEELOG_MAX_SIZE ||
+	    snap->max_len > teelog_ring_capacity_max_len(capacity) ||
+	    snap->last_pos > snap->max_len)
+		return -EIO;
+	if ((snap->seq & 1ULL) || teelog_seq_load(&ring->flag) != snap->seq)
+		return -EAGAIN;
+	smp_rmb();
+	while (off < snap->last_pos) {
+		if (snap->last_pos - off < TEELOG_ITEM_HDR_SIZE) {
+			rc = -EIO;
+			break;
+		}
+		memcpy(&item, ring->buffer_start + off, sizeof(item));
+		if (!teelog_item_hdr_valid(&item, snap->last_pos - off)) {
+			rc = -EIO;
+			break;
+		}
+		if (off == observed)
+			found = true;
+		if (found)
+			count++;
+		serial = item.serial_no;
+		off += teelog_item_total_len(&item);
+	}
+	smp_rmb();
+	if (teelog_seq_load(&ring->flag) != snap->seq)
+		return -EAGAIN;
+	if (rc)
+		return rc;
+	*suffix = count;
+	*last_serial = serial;
+	*boundary = found || off == observed;
+	return 0;
 }
 
-bool teelog_reader_catchup(struct teelog_reader_pos *pos,
-			   const struct teelog_hdr_snap *snap)
+int teelog_reader_seek_current(struct teelog_reader_pos *pos,
+			       const struct teelog_hdr_snap *snap,
+			       const struct teelog_buffer *ring, u32 capacity)
+{
+	struct teelog_reader_pos next;
+	u32 count, serial;
+	bool boundary;
+	int rc;
+
+	if (!pos || !snap)
+		return -EIO;
+	rc = teelog_prefix_snapshot(ring, capacity, snap, 0,
+				    &count, &serial, &boundary);
+	if (rc)
+		return rc;
+	teelog_reader_init_current(&next, snap);
+	if (snap->last_pos) {
+		/* Skip pre-seek records even if a short wrap leaves them retained. */
+		next.r_serial = serial;
+		next.r_serial_valid = true;
+	}
+	*pos = next;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(teelog_reader_seek_current);
+
+/* A rising tip is no-wrap only if its new suffix contains every new commit. */
+static int teelog_observed_span_wrapped(const struct teelog_reader_pos *pos,
+				      const struct teelog_hdr_snap *snap,
+				      const struct teelog_buffer *ring,
+				      u32 capacity)
+{
+	u64 commits = (snap->seq - pos->r_obs_seq) / 2;
+	u32 count, serial;
+	bool boundary;
+	int rc;
+
+	if (commits > (snap->last_pos - pos->r_obs_last) /
+			(TEELOG_ITEM_HDR_SIZE + TEELOG_ITEM_LEN_ALIGN))
+		return 1;
+	if (!commits)
+		return pos->r_obs_last != snap->last_pos;
+	rc = teelog_prefix_snapshot(ring, capacity, snap, pos->r_obs_last,
+				    &count, &serial, &boundary);
+	if (rc)
+		return rc;
+	return !boundary || count != commits;
+}
+
+int teelog_reader_catchup(struct teelog_reader_pos *pos,
+			  const struct teelog_hdr_snap *snap,
+			  const struct teelog_buffer *ring, u32 capacity)
 {
 	u64 seq_delta;
 	u32 loop_delta;
-	bool lapped = false;
+	int lapped = 0;
 
-	if (!pos || !snap)
-		return false;
+	if (!pos || !snap || snap->last_pos > snap->max_len)
+		return -EIO;
 
-	/* seq is even and advances by 2 per commit → 2^31 commits = 2^32. */
+	/* seq is even and advances by 2 per commit -> 2^31 commits = 2^32. */
 	seq_delta = snap->seq - pos->r_seq;
-	if (seq_delta >= (1ULL << 32)) {
-		teelog_reader_jump_retain(pos, snap);
-		return true;
+	if (seq_delta >= (1ULL << 32) || pos->r_off > snap->max_len) {
+		teelog_reader_jump_retain(pos, snap, true);
+		return 1;
 	}
 
-	if (pos->r_off > snap->max_len) {
-		teelog_reader_jump_retain(pos, snap);
-		return true;
-	}
-
-	if (snap->write_loops == U32_MAX && pos->r_loops == U32_MAX) {
-		/*
-		 * CR-004: loops stuck at saturation. Detect lapping via
-		 * position relation and seq progress — not only last_pos <
-		 * r_off (a full ring back to the same offset keeps last_pos
-		 * == r_off while seq advances).
-		 */
-		if (snap->seq != pos->r_seq) {
-			if (snap->last_pos < pos->r_off)
-				lapped = true;
-			else if (snap->last_pos == pos->r_off)
-				lapped = true;
-			else if (seq_delta >= teelog_seq_per_ring(snap->max_len))
-				lapped = true;
-		}
-	} else if (pos->r_loops != snap->write_loops) {
+	if (pos->r_loops != snap->write_loops) {
 		loop_delta = snap->write_loops - pos->r_loops;
 		if (loop_delta > 1U ||
 		    (loop_delta == 1U && pos->r_off < snap->last_pos))
-			lapped = true;
+			lapped = 1;
+	}
+	if (!lapped && snap->write_loops == U32_MAX) {
+		/* Also check readers still consuming the retained tail (MAX-1). */
+		if (!pos->r_obs_valid || pos->r_obs_last > snap->max_len) {
+			lapped = 1;
+		} else if (snap->seq != pos->r_obs_seq) {
+			if (snap->last_pos <= pos->r_obs_last ||
+			    (pos->r_loops == U32_MAX &&
+			     snap->last_pos <= pos->r_off))
+				lapped = 1;
+			else
+				lapped = teelog_observed_span_wrapped(pos, snap,
+							     ring, capacity);
+		}
+	}
+	if (lapped < 0)
+		return lapped;
+	if (lapped) {
+		teelog_reader_jump_retain(pos, snap, false);
+		return 1;
 	}
 
-	if (!lapped)
-		return false;
-
-	teelog_reader_jump_retain(pos, snap);
-	return true;
+	pos->r_obs_last = snap->last_pos;
+	pos->r_obs_seq = snap->seq;
+	pos->r_obs_valid = true;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(teelog_reader_catchup);
 
@@ -188,7 +292,7 @@ bool teelog_reader_has_data(const struct teelog_reader_pos *pos,
 	 * after catchup repositions to the retain window.
 	 */
 	if (snap->write_loops == U32_MAX && pos->r_loops == U32_MAX &&
-	    snap->seq != pos->r_seq)
+	    snap->seq != (pos->r_obs_valid ? pos->r_obs_seq : pos->r_seq))
 		return true;
 
 	return false;

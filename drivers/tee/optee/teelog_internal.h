@@ -52,6 +52,30 @@ enum teelog_recover_action {
 	TEELOG_RECOVER_ABORT,
 };
 
+/*
+ * Gate before any TEE query / free: occupied alone is not ownership of a
+ * live mapper, and inactive TEE replies must not free another backend's pages.
+ */
+enum teelog_recover_gate {
+	TEELOG_RECOVER_GATE_PROCEED = 0,
+	TEELOG_RECOVER_GATE_SKIP_LIVE,
+	TEELOG_RECOVER_GATE_SKIP_OWNER,
+};
+
+static inline enum teelog_recover_gate
+teelog_recover_owner_gate(bool occupied, bool live, u64 slot_owner,
+			  u64 my_owner)
+{
+	if (!occupied)
+		return TEELOG_RECOVER_GATE_PROCEED;
+	if (live)
+		return TEELOG_RECOVER_GATE_SKIP_LIVE;
+	/* Unknown owner fails closed — not a recoverable credential. */
+	if (!my_owner || !slot_owner || slot_owner != my_owner)
+		return TEELOG_RECOVER_GATE_SKIP_OWNER;
+	return TEELOG_RECOVER_GATE_PROCEED;
+}
+
 static inline enum teelog_recover_action
 teelog_recover_decide(bool query_ok, bool active, bool matched)
 {
